@@ -22,12 +22,24 @@ class GeminiModelInfo:
 
 class GeminiClient:
     MAX_RETRY_ATTEMPTS = 5
+    MAX_BATCH_SIZE = 20
+    MAX_BATCH_CHARACTERS = 12000
+    NON_TEXT_MODEL_MARKERS = (
+        "tts",
+        "image",
+        "audio",
+        "native-audio",
+        "computer-use",
+        "robotics",
+        "pro",
+    )
 
     def __init__(self, api_key: str, model: str, base_url: str) -> None:
         self.api_key = api_key
         self.model = model
         self.base_url = base_url.rstrip("/")
         self._resolved_model: str | None = None
+        self._temporarily_unavailable_models: dict[str, float] = {}
 
     def usage(self):
         return None
@@ -44,6 +56,8 @@ class GeminiClient:
                 continue
             name = str(item.get("name", ""))
             if not name.startswith("models/gemini"):
+                continue
+            if not self._supports_text_generation_model(name):
                 continue
             generation_methods = item.get("supportedGenerationMethods", [])
             if not isinstance(generation_methods, list):
@@ -76,25 +90,24 @@ class GeminiClient:
     ) -> list[str]:
         del glossary_id
         translated: list[str] = []
-        for text in texts:
-            translated.append(
-                self._translate_single(
-                    text=text,
+        for chunk in self._chunk_texts(texts):
+            translated.extend(
+                self._translate_chunk(
+                    texts=chunk,
                     source_lang=source_lang,
                     target_lang=target_lang,
                 )
             )
         return translated
 
-    def _translate_single(
-        self, *, text: str, source_lang: str, target_lang: str
-    ) -> str:
-        model_id = self._resolve_generation_model()
+    def _translate_chunk(
+        self, *, texts: list[str], source_lang: str, target_lang: str
+    ) -> list[str]:
         prompt = (
-            "Translate the following text. Return only the translated text without "
-            "explanations or extra formatting. "
-            f"Source language: {source_lang}. Target language: {target_lang}.\n\n"
-            f"Text:\n{text}"
+            "Translate each item in the input list. Return strict JSON with this exact "
+            'shape: {"translations": ["..."]}. Do not include markdown fences or extra text. '
+            f"Source language: {source_lang}. Target language: {target_lang}. Preserve list order.\n\n"
+            "Input JSON:\n" + json.dumps({"texts": texts}, ensure_ascii=False)
         )
         body = {
             "contents": [
@@ -105,25 +118,66 @@ class GeminiClient:
             ],
             "generationConfig": {"temperature": 0},
         }
-        try:
-            payload = self._request_json(
-                "POST", f"/v1beta/models/{model_id}:generateContent", body
-            )
-        except GeminiError as exc:
-            if self._is_model_quota_exhausted_error(exc):
-                fallback_model = self._resolve_alternate_generation_model(
-                    excluded_model=model_id,
-                    refresh=True,
+
+        attempted_models: set[str] = set()
+        model_id = self._resolve_generation_model()
+        while True:
+            attempted_models.add(model_id)
+            try:
+                payload = self._request_json(
+                    "POST", f"/v1beta/models/{model_id}:generateContent", body
                 )
-            elif self._is_model_not_found_error(exc):
-                fallback_model = self._resolve_generation_model(refresh=True)
-            else:
-                raise
-            if fallback_model == model_id:
-                raise
-            payload = self._request_json(
-                "POST", f"/v1beta/models/{fallback_model}:generateContent", body
-            )
+                self._resolved_model = model_id
+                break
+            except GeminiError as exc:
+                if self._is_model_quota_exhausted_error(exc):
+                    self._mark_model_temporarily_unavailable(model_id, exc)
+                    fallback_model = self._resolve_alternate_generation_model(
+                        excluded_models=attempted_models,
+                        refresh=True,
+                    )
+                elif self._is_invalid_text_modality_error(exc):
+                    self._mark_model_temporarily_unavailable(model_id, exc)
+                    fallback_model = self._resolve_alternate_generation_model(
+                        excluded_models=attempted_models,
+                        refresh=True,
+                    )
+                elif self._is_model_not_found_error(exc):
+                    fallback_model = self._resolve_generation_model(refresh=True)
+                else:
+                    raise
+                if fallback_model in attempted_models:
+                    raise
+                model_id = fallback_model
+
+        response_text = self._extract_response_text(payload)
+        parsed = self._parse_translations_payload(response_text)
+        if len(parsed) != len(texts):
+            raise GeminiError("Gemini response translation count mismatch")
+        return parsed
+
+    @classmethod
+    def _chunk_texts(cls, texts: list[str]) -> list[list[str]]:
+        chunks: list[list[str]] = []
+        current_chunk: list[str] = []
+        current_size = 0
+        for text in texts:
+            text_size = len(text)
+            if current_chunk and (
+                len(current_chunk) >= cls.MAX_BATCH_SIZE
+                or current_size + text_size > cls.MAX_BATCH_CHARACTERS
+            ):
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_size = 0
+            current_chunk.append(text)
+            current_size += text_size
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks
+
+    @staticmethod
+    def _extract_response_text(payload: dict[str, Any]) -> str:
         candidates = payload.get("candidates", [])
         if not isinstance(candidates, list) or not candidates:
             raise GeminiError("Gemini response missing candidates")
@@ -136,10 +190,28 @@ class GeminiClient:
         parts = content.get("parts", [])
         if not isinstance(parts, list) or not parts:
             raise GeminiError("Gemini response content parts missing")
-        first_part = parts[0]
-        if not isinstance(first_part, dict) or "text" not in first_part:
+        text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
+        combined = "".join(str(part) for part in text_parts).strip()
+        if not combined:
             raise GeminiError("Gemini response text part missing")
-        return str(first_part["text"]).strip()
+        return combined
+
+    @staticmethod
+    def _parse_translations_payload(response_text: str) -> list[str]:
+        stripped = response_text.strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+            stripped = re.sub(r"\s*```$", "", stripped)
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise GeminiError("Gemini response is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise GeminiError("Gemini response payload is not an object")
+        translations = payload.get("translations")
+        if not isinstance(translations, list):
+            raise GeminiError("Gemini response translations missing")
+        return [str(item).strip() for item in translations]
 
     def _request_json(
         self, method: str, path: str, body: dict[str, object] | None = None
@@ -187,7 +259,11 @@ class GeminiClient:
             return payload
 
     def _resolve_generation_model(self, refresh: bool = False) -> str:
-        if self._resolved_model is not None and not refresh:
+        if (
+            self._resolved_model is not None
+            and not refresh
+            and not self._is_model_temporarily_unavailable(self._resolved_model)
+        ):
             return self._resolved_model
 
         requested_model = self.model.strip().removeprefix("models/")
@@ -197,25 +273,44 @@ class GeminiClient:
             self._resolved_model = requested_model
             return requested_model
 
-        resolved_model = self._match_requested_model(requested_model, models)
+        ranked_models = self._rank_candidate_models(
+            requested_model,
+            models,
+            prefer_low_quota_risk=True,
+        )
+        resolved_model = next(
+            (
+                model.model_id
+                for model in ranked_models
+                if not self._is_model_temporarily_unavailable(model.model_id)
+            ),
+            None,
+        )
         self._resolved_model = resolved_model or requested_model
         return self._resolved_model
 
     def _resolve_alternate_generation_model(
-        self, *, excluded_model: str, refresh: bool = False
+        self, *, excluded_models: set[str], refresh: bool = False
     ) -> str:
         requested_model = self.model.strip().removeprefix("models/")
         try:
             models = self.list_models()
         except GeminiError:
-            return excluded_model
+            return next(iter(excluded_models))
 
-        ranked_models = self._rank_candidate_models(requested_model, models)
+        ranked_models = self._rank_candidate_models(
+            requested_model,
+            models,
+            prefer_low_quota_risk=True,
+        )
         for model in ranked_models:
-            if model.model_id != excluded_model:
-                self._resolved_model = model.model_id
-                return model.model_id
-        return excluded_model
+            if model.model_id in excluded_models:
+                continue
+            if self._is_model_temporarily_unavailable(model.model_id):
+                continue
+            self._resolved_model = model.model_id
+            return model.model_id
+        return next(iter(excluded_models))
 
     @staticmethod
     def _match_requested_model(
@@ -228,7 +323,9 @@ class GeminiClient:
 
     @staticmethod
     def _rank_candidate_models(
-        requested_model: str, models: list[GeminiModelInfo]
+        requested_model: str,
+        models: list[GeminiModelInfo],
+        prefer_low_quota_risk: bool = False,
     ) -> list[GeminiModelInfo]:
         if not models:
             return []
@@ -237,7 +334,7 @@ class GeminiClient:
             (model.model_id for model in models if model.model_id == requested_model),
             None,
         )
-        if exact_match is not None:
+        if exact_match is not None and not prefer_low_quota_risk:
             return [model for model in models if model.model_id == exact_match] + [
                 model for model in models if model.model_id != exact_match
             ]
@@ -259,6 +356,13 @@ class GeminiClient:
                 score += 25
             if "pro" in requested_key and "pro" in model_key:
                 score += 25
+            if prefer_low_quota_risk:
+                if "flash" in model_key:
+                    score += 90
+                if "lite" in model_key:
+                    score += 60
+                if "pro" in model_key:
+                    score -= 220
             if score > 0:
                 ranked.append((score, model))
 
@@ -283,6 +387,37 @@ class GeminiClient:
         return (
             " 404 " in message and "models/" in message and "generateContent" in message
         )
+
+    @classmethod
+    def _supports_text_generation_model(cls, model_name: str) -> bool:
+        normalized = model_name.lower()
+        return not any(marker in normalized for marker in cls.NON_TEXT_MODEL_MARKERS)
+
+    @staticmethod
+    def _is_invalid_text_modality_error(exc: GeminiError) -> bool:
+        message = str(exc)
+        normalized = message.lower()
+        return (
+            " 400 " in message
+            and "response modalities" in normalized
+            and "text" in normalized
+            and "not supported by the model" in normalized
+        )
+
+    def _mark_model_temporarily_unavailable(
+        self, model_id: str, exc: GeminiError
+    ) -> None:
+        retry_delay = self._extract_retry_delay_seconds(str(exc)) or 60.0
+        self._temporarily_unavailable_models[model_id] = time.time() + retry_delay
+
+    def _is_model_temporarily_unavailable(self, model_id: str) -> bool:
+        unavailable_until = self._temporarily_unavailable_models.get(model_id)
+        if unavailable_until is None:
+            return False
+        if unavailable_until <= time.time():
+            self._temporarily_unavailable_models.pop(model_id, None)
+            return False
+        return True
 
     @staticmethod
     def _is_model_quota_exhausted_error(exc: GeminiError) -> bool:
