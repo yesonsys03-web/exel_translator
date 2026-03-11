@@ -297,3 +297,36 @@ def test_pipeline_supports_gemini_provider(
     assert result.preview_mode is False
     assert result.translated_path.exists()
     assert '"provider": "gemini"' in usage_report
+
+
+def test_pipeline_emits_realtime_logs(tmp_path: Path) -> None:
+    workbook = build_sample_workbook()
+    input_path = tmp_path / "sample.xlsx"
+    workbook.save(input_path)
+
+    config = AppConfig(
+        input_path=input_path,
+        output_dir=tmp_path / "out",
+        sheet_name=None,
+        selected_columns=[],
+        glossary_path=Path("/Users/usabatch/coding/hazbin_project/glossary.tsv"),
+        exclude_patterns_path=Path(
+            "/Users/usabatch/coding/hazbin_project/exclude_patterns.yaml"
+        ),
+        target_lang="KO",
+        source_lang="EN",
+        provider="deepl",
+        deepl_api_key="",
+        deepl_base_url="https://api-free.deepl.com",
+        gemini_api_key="",
+        gemini_model="gemini-3-flash",
+        gemini_base_url="https://generativelanguage.googleapis.com",
+        cache_path=tmp_path / "cache.sqlite3",
+    )
+
+    logs: list[str] = []
+    run_pipeline(config, log_callback=logs.append)
+
+    assert any("Pipeline started" in message for message in logs)
+    assert any("Selected columns" in message for message in logs)
+    assert any("Saved usage report" in message for message in logs)

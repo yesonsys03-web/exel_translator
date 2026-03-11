@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QAbstractItemView,
     QTableWidget,
@@ -75,14 +76,19 @@ class PipelineWorker(QObject):
     # [ANCHOR:UI_PIPELINE_WORKER]
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
+    progress = pyqtSignal(str)
 
     def __init__(self, config) -> None:
         super().__init__()
         self.config = config
 
     def run(self) -> None:
+        def _emit_progress(message: str) -> None:
+            self.progress.emit(message)
+            print(message)
+
         try:
-            result = run_pipeline(self.config)
+            result = run_pipeline(self.config, log_callback=_emit_progress)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             return
@@ -179,6 +185,11 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel("파일을 선택한 뒤 '컬럼 분석'을 누르세요.")
         layout.addWidget(self.status_label)
+
+        layout.addWidget(QLabel("실시간 로그"))
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view)
 
         self.load_workbook_preview()
         self._apply_provider_from_env()
@@ -348,6 +359,7 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(False)
         self.load_button.setEnabled(False)
         self.status_label.setText("실행 중...")
+        self.log_view.clear()
         worker_thread = QThread(self)
         worker = PipelineWorker(config)
         self.worker_thread = worker_thread
@@ -356,6 +368,7 @@ class MainWindow(QMainWindow):
         worker_thread.started.connect(worker.run)
         worker.finished.connect(self.handle_run_finished)
         worker.failed.connect(self.handle_run_failed)
+        worker.progress.connect(self.handle_run_progress)
         worker.finished.connect(worker_thread.quit)
         worker.failed.connect(worker_thread.quit)
         worker_thread.finished.connect(self.cleanup_worker)
@@ -389,6 +402,9 @@ class MainWindow(QMainWindow):
         self.load_button.setEnabled(True)
         self.status_label.setText("실행 실패")
         QMessageBox.critical(self, "실행 실패", message)
+
+    def handle_run_progress(self, message: str) -> None:
+        self.log_view.appendPlainText(message)
 
     def cleanup_worker(self) -> None:
         # [ANCHOR:UI_WORKER_CLEANUP]

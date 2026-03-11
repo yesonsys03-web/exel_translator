@@ -132,7 +132,7 @@ def main() -> int:
         cache_path=Path(args.cache_path),
         env_file=Path(args.env_file),
     )
-    result = run_pipeline(config)
+    result = run_pipeline(config, log_callback=print)
     if result.preview_mode:
         print(
             "Preview mode: DEEPL_API_KEY not set, translation API calls were skipped."

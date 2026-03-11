@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -43,6 +43,9 @@ class PipelineResult:
     preview_mode: bool
 
 
+LogCallback = Callable[[str], None]
+
+
 def load_exclude_patterns(path: Path) -> list[re.Pattern[str]]:
     # [ANCHOR:PIPELINE_LOAD_EXCLUDE_PATTERNS]
     if not path.exists():
@@ -56,8 +59,11 @@ def load_exclude_patterns(path: Path) -> list[re.Pattern[str]]:
     return [re.compile(str(pattern)) for pattern in raw_patterns]
 
 
-def run_pipeline(config: AppConfig) -> PipelineResult:
+def run_pipeline(
+    config: AppConfig, *, log_callback: LogCallback | None = None
+) -> PipelineResult:
     # [ANCHOR:PIPELINE_RUN]
+    _emit_log(log_callback, f"Pipeline started (provider={config.provider})")
     workbook = load_excel_workbook(config.input_path)
     mapped_workbook = load_excel_workbook(config.input_path)
     context = build_sheet_context(workbook, config.sheet_name)
@@ -75,12 +81,19 @@ def run_pipeline(config: AppConfig) -> PipelineResult:
     )
     selected_column_indexes = [profile.index for profile in selected_profiles]
     selected_headers = [profile.header for profile in selected_profiles]
+    _emit_log(log_callback, f"Selected columns: {len(selected_headers)}")
     translation_columns = append_translation_columns(
         context.worksheet, context.header_row, selected_column_indexes
     )
 
     cache = TranslationCache(config.cache_path)
     client = _build_translation_client(config)
+    _emit_log(
+        log_callback,
+        "Preview mode enabled, API calls skipped"
+        if client is None
+        else "Translation client initialized",
+    )
     cache_namespace = _build_cache_namespace(config)
     usage_before_count = 0
     usage_limit = 0
@@ -93,6 +106,10 @@ def run_pipeline(config: AppConfig) -> PipelineResult:
 
     try:
         for source_column, target_column in translation_columns.items():
+            _emit_log(
+                log_callback,
+                f"Translating column {_column_label(context, source_column)} -> {_column_label(context, target_column)}",
+            )
             _translate_column(
                 context=context,
                 source_column=source_column,
@@ -106,6 +123,7 @@ def run_pipeline(config: AppConfig) -> PipelineResult:
                 audit_entries=audit_entries,
                 mapped_context=mapped_context,
                 cache_namespace=cache_namespace,
+                log_callback=log_callback,
             )
 
         translated_path = config.output_dir / "translated.xlsx"
@@ -114,7 +132,10 @@ def run_pipeline(config: AppConfig) -> PipelineResult:
         usage_path = config.output_dir / "usage_report.json"
         save_workbook(workbook, translated_path)
         save_workbook(mapped_workbook, source_mapped_path)
+        _emit_log(log_callback, f"Saved translated workbook: {translated_path}")
+        _emit_log(log_callback, f"Saved source mapped workbook: {source_mapped_path}")
         export_audit(audit_entries, audit_path)
+        _emit_log(log_callback, f"Saved audit workbook: {audit_path}")
         usage_after_count = usage_before_count
         if client is not None:
             usage_after = client.usage()
@@ -136,8 +157,10 @@ def run_pipeline(config: AppConfig) -> PipelineResult:
             },
             usage_path,
         )
+        _emit_log(log_callback, f"Saved usage report: {usage_path}")
     finally:
         cache.close()
+        _emit_log(log_callback, "Pipeline finished")
 
     return PipelineResult(
         translated_path=translated_path,
@@ -179,6 +202,7 @@ def _translate_column(
     audit_entries: list[AuditEntry],
     mapped_context: SheetContext,
     cache_namespace: str,
+    log_callback: LogCallback | None,
 ) -> None:
     # [ANCHOR:PIPELINE_TRANSLATE_COLUMN]
     values_by_row: dict[int, str] = {}
@@ -230,6 +254,10 @@ def _translate_column(
         if key in cached_by_key
     }
     missing = [text for text in deduped_texts if text not in cached]
+    _emit_log(
+        log_callback,
+        f"Column {context.headers[source_column]}: total={len(deduped_texts)} cache_hit={len(cached)} request={len(missing)}",
+    )
     translated_pairs: dict[str, str] = {}
     if client is not None and missing:
         translated = client.translate_batch(
@@ -246,6 +274,7 @@ def _translate_column(
                 for text, translated_text in translated_pairs.items()
             }
         )
+
     all_translations = {**cached, **translated_pairs}
 
     for row_index, protected in protected_values_by_row.items():
@@ -269,6 +298,20 @@ def _translate_column(
                 "missing_api_key_preview" if client is None else "",
             )
         )
+
+
+def _emit_log(log_callback: LogCallback | None, message: str) -> None:
+    if log_callback is None:
+        return
+    log_callback(message)
+
+
+def _column_label(context: SheetContext, column_index: int) -> str:
+    header = context.headers.get(column_index)
+    if header:
+        return header
+    fallback_header = context.worksheet.cell(context.header_row, column_index).value
+    return build_column_label(column_index, str(fallback_header or "translation"))
 
 
 def _build_translation_client(config: AppConfig):
