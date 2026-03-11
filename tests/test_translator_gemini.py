@@ -5,7 +5,11 @@ from email.message import Message
 import pytest
 from urllib.error import HTTPError
 
-from harmony_translate.translator_gemini import GeminiClient
+from harmony_translate.translator_gemini import (
+    GeminiClient,
+    GeminiError,
+    GeminiModelInfo,
+)
 
 
 def test_list_models_filters_to_gemini_generate_content(
@@ -54,6 +58,19 @@ def test_translate_batch_uses_generate_content_response(
         api_key="gemini-key",
         model="gemini-2.0-flash",
         base_url="https://generativelanguage.googleapis.com",
+    )
+
+    monkeypatch.setattr(
+        client,
+        "list_models",
+        lambda: [
+            GeminiModelInfo(
+                model_id="gemini-2.0-flash",
+                display_name="Gemini 2.0 Flash",
+                input_token_limit=1048576,
+                output_token_limit=8192,
+            )
+        ],
     )
 
     def fake_request_json(method: str, path: str, body=None):
@@ -120,3 +137,183 @@ def test_extract_retry_delay_seconds_from_message_fallback() -> None:
     assert GeminiClient._extract_retry_delay_seconds(detail) == pytest.approx(
         4.921498276
     )
+
+
+def test_match_requested_model_resolves_alias_to_preview_variant() -> None:
+    models = [
+        GeminiModelInfo(
+            model_id="gemini-3-flash-preview",
+            display_name="Gemini 3 Flash Preview",
+            input_token_limit=1048576,
+            output_token_limit=65536,
+        ),
+        GeminiModelInfo(
+            model_id="gemini-2.5-flash",
+            display_name="Gemini 2.5 Flash",
+            input_token_limit=1048576,
+            output_token_limit=65536,
+        ),
+    ]
+
+    resolved = GeminiClient._match_requested_model("gemini-3-flash", models)
+
+    assert resolved == "gemini-3-flash-preview"
+
+
+def test_translate_batch_uses_resolved_model_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GeminiClient(
+        api_key="gemini-key",
+        model="gemini-3-flash",
+        base_url="https://generativelanguage.googleapis.com",
+    )
+
+    monkeypatch.setattr(
+        client,
+        "list_models",
+        lambda: [
+            GeminiModelInfo(
+                model_id="gemini-3-flash-preview",
+                display_name="Gemini 3 Flash Preview",
+                input_token_limit=1048576,
+                output_token_limit=65536,
+            )
+        ],
+    )
+
+    calls: list[str] = []
+
+    def fake_request_json(method: str, path: str, body=None):
+        del method, body
+        calls.append(path)
+        return {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"text": "안녕하세요"}],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_request_json", fake_request_json)
+
+    translated = client.translate_batch(["Hello"], source_lang="EN", target_lang="KO")
+
+    assert translated == ["안녕하세요"]
+    assert calls == ["/v1beta/models/gemini-3-flash-preview:generateContent"]
+
+
+def test_translate_batch_retries_with_refreshed_model_after_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GeminiClient(
+        api_key="gemini-key",
+        model="gemini-3-flash",
+        base_url="https://generativelanguage.googleapis.com",
+    )
+    client._resolved_model = "gemini-3-flash"
+
+    list_models_calls = {"count": 0}
+
+    def fake_list_models() -> list[GeminiModelInfo]:
+        list_models_calls["count"] += 1
+        return [
+            GeminiModelInfo(
+                model_id="gemini-3-flash-preview",
+                display_name="Gemini 3 Flash Preview",
+                input_token_limit=1048576,
+                output_token_limit=65536,
+            )
+        ]
+
+    calls: list[str] = []
+
+    def fake_request_json(method: str, path: str, body=None):
+        del method, body
+        calls.append(path)
+        if path == "/v1beta/models/gemini-3-flash:generateContent":
+            raise GeminiError(
+                'Gemini request failed: 404 {"error":{"message":"models/gemini-3-flash is not found for API version v1beta, or is not supported for generateContent."}}'
+            )
+        return {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"text": "안녕하세요"}],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "list_models", fake_list_models)
+    monkeypatch.setattr(client, "_request_json", fake_request_json)
+
+    translated = client.translate_batch(["Hello"], source_lang="EN", target_lang="KO")
+
+    assert translated == ["안녕하세요"]
+    assert list_models_calls["count"] == 1
+    assert calls == [
+        "/v1beta/models/gemini-3-flash:generateContent",
+        "/v1beta/models/gemini-3-flash-preview:generateContent",
+    ]
+
+
+def test_translate_batch_falls_back_to_alternate_model_on_quota_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GeminiClient(
+        api_key="gemini-key",
+        model="gemini-3-flash",
+        base_url="https://generativelanguage.googleapis.com",
+    )
+    client._resolved_model = "gemini-3-flash-preview"
+
+    monkeypatch.setattr(
+        client,
+        "list_models",
+        lambda: [
+            GeminiModelInfo(
+                model_id="gemini-3-flash-preview",
+                display_name="Gemini 3 Flash Preview",
+                input_token_limit=1048576,
+                output_token_limit=65536,
+            ),
+            GeminiModelInfo(
+                model_id="gemini-2.5-flash",
+                display_name="Gemini 2.5 Flash",
+                input_token_limit=1048576,
+                output_token_limit=65536,
+            ),
+        ],
+    )
+
+    calls: list[str] = []
+
+    def fake_request_json(method: str, path: str, body=None):
+        del method, body
+        calls.append(path)
+        if path == "/v1beta/models/gemini-3-flash-preview:generateContent":
+            raise GeminiError(
+                'Gemini request failed: 429 {"error":{"message":"Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3-flash","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaDimensions":{"model":"gemini-3-flash"}}]}]}}'
+            )
+        return {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"text": "안녕하세요"}],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_request_json", fake_request_json)
+
+    translated = client.translate_batch(["Hello"], source_lang="EN", target_lang="KO")
+
+    assert translated == ["안녕하세요"]
+    assert calls == [
+        "/v1beta/models/gemini-3-flash-preview:generateContent",
+        "/v1beta/models/gemini-2.5-flash:generateContent",
+    ]

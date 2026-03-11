@@ -27,6 +27,7 @@ class GeminiClient:
         self.api_key = api_key
         self.model = model
         self.base_url = base_url.rstrip("/")
+        self._resolved_model: str | None = None
 
     def usage(self):
         return None
@@ -88,6 +89,7 @@ class GeminiClient:
     def _translate_single(
         self, *, text: str, source_lang: str, target_lang: str
     ) -> str:
+        model_id = self._resolve_generation_model()
         prompt = (
             "Translate the following text. Return only the translated text without "
             "explanations or extra formatting. "
@@ -103,9 +105,25 @@ class GeminiClient:
             ],
             "generationConfig": {"temperature": 0},
         }
-        payload = self._request_json(
-            "POST", f"/v1beta/models/{self.model}:generateContent", body
-        )
+        try:
+            payload = self._request_json(
+                "POST", f"/v1beta/models/{model_id}:generateContent", body
+            )
+        except GeminiError as exc:
+            if self._is_model_quota_exhausted_error(exc):
+                fallback_model = self._resolve_alternate_generation_model(
+                    excluded_model=model_id,
+                    refresh=True,
+                )
+            elif self._is_model_not_found_error(exc):
+                fallback_model = self._resolve_generation_model(refresh=True)
+            else:
+                raise
+            if fallback_model == model_id:
+                raise
+            payload = self._request_json(
+                "POST", f"/v1beta/models/{fallback_model}:generateContent", body
+            )
         candidates = payload.get("candidates", [])
         if not isinstance(candidates, list) or not candidates:
             raise GeminiError("Gemini response missing candidates")
@@ -131,6 +149,10 @@ class GeminiClient:
                 return self._request_json_once(method, path, body)
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="ignore")
+                if exc.code == 429 and self._is_model_quota_exhausted_detail(detail):
+                    raise GeminiError(
+                        f"Gemini request failed: {exc.code} {detail}"
+                    ) from exc
                 if exc.code == 429 and attempt < self.MAX_RETRY_ATTEMPTS:
                     retry_delay = self._extract_retry_delay_seconds(detail)
                     fallback_delay = min(2**attempt, 30)
@@ -163,6 +185,118 @@ class GeminiClient:
             if not isinstance(payload, dict):
                 raise GeminiError("Gemini response payload is not an object")
             return payload
+
+    def _resolve_generation_model(self, refresh: bool = False) -> str:
+        if self._resolved_model is not None and not refresh:
+            return self._resolved_model
+
+        requested_model = self.model.strip().removeprefix("models/")
+        try:
+            models = self.list_models()
+        except GeminiError:
+            self._resolved_model = requested_model
+            return requested_model
+
+        resolved_model = self._match_requested_model(requested_model, models)
+        self._resolved_model = resolved_model or requested_model
+        return self._resolved_model
+
+    def _resolve_alternate_generation_model(
+        self, *, excluded_model: str, refresh: bool = False
+    ) -> str:
+        requested_model = self.model.strip().removeprefix("models/")
+        try:
+            models = self.list_models()
+        except GeminiError:
+            return excluded_model
+
+        ranked_models = self._rank_candidate_models(requested_model, models)
+        for model in ranked_models:
+            if model.model_id != excluded_model:
+                self._resolved_model = model.model_id
+                return model.model_id
+        return excluded_model
+
+    @staticmethod
+    def _match_requested_model(
+        requested_model: str, models: list[GeminiModelInfo]
+    ) -> str | None:
+        ranked_models = GeminiClient._rank_candidate_models(requested_model, models)
+        if not ranked_models:
+            return None
+        return ranked_models[0].model_id
+
+    @staticmethod
+    def _rank_candidate_models(
+        requested_model: str, models: list[GeminiModelInfo]
+    ) -> list[GeminiModelInfo]:
+        if not models:
+            return []
+
+        exact_match = next(
+            (model.model_id for model in models if model.model_id == requested_model),
+            None,
+        )
+        if exact_match is not None:
+            return [model for model in models if model.model_id == exact_match] + [
+                model for model in models if model.model_id != exact_match
+            ]
+
+        requested_key = GeminiClient._normalize_model_key(requested_model)
+        ranked: list[tuple[int, GeminiModelInfo]] = []
+        for model in models:
+            model_key = GeminiClient._normalize_model_key(model.model_id)
+            score = 0
+            if model.model_id.startswith(requested_model):
+                score += 100
+            if requested_key == model_key:
+                score += 90
+            requested_tokens = requested_key.split("-")
+            score += sum(
+                10 for token in requested_tokens if token and token in model_key
+            )
+            if "flash" in requested_key and "flash" in model_key:
+                score += 25
+            if "pro" in requested_key and "pro" in model_key:
+                score += 25
+            if score > 0:
+                ranked.append((score, model))
+
+        if not ranked:
+            return []
+
+        ranked.sort(key=lambda item: (-item[0], item[1].model_id))
+        return [item[1] for item in ranked]
+
+    @staticmethod
+    def _normalize_model_key(model_id: str) -> str:
+        normalized = model_id.lower().removeprefix("models/")
+        normalized = normalized.replace(".", "-")
+        normalized = re.sub(r"-preview(?:-[0-9]{2}-[0-9]{2})?", "", normalized)
+        normalized = re.sub(r"-[0-9]{3}$", "", normalized)
+        normalized = re.sub(r"-+", "-", normalized).strip("-")
+        return normalized
+
+    @staticmethod
+    def _is_model_not_found_error(exc: GeminiError) -> bool:
+        message = str(exc)
+        return (
+            " 404 " in message and "models/" in message and "generateContent" in message
+        )
+
+    @staticmethod
+    def _is_model_quota_exhausted_error(exc: GeminiError) -> bool:
+        message = str(exc)
+        return GeminiClient._is_model_quota_exhausted_detail(message)
+
+    @staticmethod
+    def _is_model_quota_exhausted_detail(detail: str) -> bool:
+        message = detail.lower()
+        return (
+            "quota exceeded for metric" in message
+            and "generate_content" in message
+            and "model" in message
+        )
 
     @staticmethod
     def _extract_retry_delay_seconds(detail: str) -> float | None:
