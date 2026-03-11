@@ -18,6 +18,8 @@ def build_config(
     output_dir: Path,
     sheet_name: str | None,
     selected_columns: list[str],
+    preserve_original_sheet: bool,
+    mapped_cell_mode: str,
     glossary_path: Path,
     exclude_patterns_path: Path,
     source_lang: str,
@@ -46,6 +48,8 @@ def build_config(
         output_dir=output_dir,
         sheet_name=sheet_name,
         selected_columns=selected_columns,
+        preserve_original_sheet=preserve_original_sheet,
+        mapped_cell_mode=mapped_cell_mode,
         glossary_path=glossary_path,
         exclude_patterns_path=exclude_patterns_path,
         target_lang=target_lang,
@@ -75,6 +79,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir", default="output", help="Directory for translated artifacts"
     )
     parser.add_argument("--sheet", default=None, help="Optional sheet name")
+    parser.add_argument(
+        "--preserve-original-sheet",
+        action="store_true",
+        help="Keep a backup sheet with original source text in source_mapped.xlsx",
+    )
+    parser.add_argument(
+        "--mapped-cell-mode",
+        default="translation_only",
+        choices=["translation_only", "original_and_translation"],
+        help="How source_mapped.xlsx cells should display translated content",
+    )
     parser.add_argument(
         "--columns",
         default="",
@@ -123,6 +138,8 @@ def main() -> int:
         output_dir=Path(args.output_dir),
         sheet_name=args.sheet,
         selected_columns=selected_columns,
+        preserve_original_sheet=args.preserve_original_sheet,
+        mapped_cell_mode=args.mapped_cell_mode,
         glossary_path=Path(args.glossary),
         exclude_patterns_path=Path(args.exclude_patterns),
         source_lang=args.source_lang,

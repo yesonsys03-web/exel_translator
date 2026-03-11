@@ -283,3 +283,44 @@ def test_progress_bar_updates_from_worker_signal(tmp_path: Path) -> None:
 
     window.close()
     app.quit()
+
+
+def test_preserve_original_checkbox_defaults_enabled(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Alpha"
+    path = tmp_path / "ui-preserve-option.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    window.input_edit.setText(str(path))
+    window.load_workbook_preview()
+
+    assert window.preserve_original_checkbox.isChecked() is True
+    assert "Sheet1_ORIGINAL" in window.preserve_original_checkbox.text()
+
+    workbook2 = Workbook()
+    second_sheet = workbook2.active
+    assert second_sheet is not None
+    second_sheet.title = "Dialogue"
+    second_sheet["A13"] = "SHOT CODE"
+    second_sheet["P13"] = "ANIMATION"
+    second_sheet["A14"] = "HH0304_010_0010"
+    second_sheet["P14"] = "Beta"
+    path2 = tmp_path / "ui-preserve-option-2.xlsx"
+    workbook2.save(path2)
+
+    window.input_edit.setText(str(path2))
+    window.load_workbook_preview()
+
+    assert "Dialogue_ORIGINAL" in window.preserve_original_checkbox.text()
+    assert window.mapped_cell_mode_combo.currentData() == "translation_only"
+
+    window.close()
+    app.quit()

@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
+    QCheckBox,
     QPushButton,
     QAbstractItemView,
     QTableWidget,
@@ -156,6 +157,21 @@ class MainWindow(QMainWindow):
         form_layout.addWidget(QLabel("Gemini 모델"), 4, 0)
         form_layout.addWidget(self.model_combo, 4, 1, 1, 2)
 
+        self.preserve_original_checkbox = QCheckBox(
+            "source_mapped.xlsx에 원문 시트 보존"
+        )
+        self.preserve_original_checkbox.setChecked(True)
+        form_layout.addWidget(self.preserve_original_checkbox, 5, 0, 1, 3)
+
+        self.mapped_cell_mode_combo = QComboBox()
+        self.mapped_cell_mode_combo.addItem("번역만 표시", "translation_only")
+        self.mapped_cell_mode_combo.addItem(
+            "원문 + 번역 함께 표시",
+            "original_and_translation",
+        )
+        form_layout.addWidget(QLabel("source_mapped 표시 방식"), 6, 0)
+        form_layout.addWidget(self.mapped_cell_mode_combo, 6, 1, 1, 2)
+
         button_row = QHBoxLayout()
         layout.addLayout(button_row)
         self.load_button = QPushButton("컬럼 분석")
@@ -241,6 +257,7 @@ class MainWindow(QMainWindow):
         if not input_path.exists():
             self.status_label.setText("입력 파일을 찾을 수 없습니다.")
             self.column_list.clear()
+            self._update_preserve_original_label(input_path=input_path, sheet_name=None)
             self._update_selection_stats_label()
             return
 
@@ -248,6 +265,9 @@ class MainWindow(QMainWindow):
         self._refresh_provider_limits()
         self._populate_sheet_names(workbook.sheetnames)
         sheet_name = self.get_selected_sheet_name()
+        self._update_preserve_original_label(
+            input_path=input_path, sheet_name=sheet_name
+        )
         context = build_sheet_context(workbook, sheet_name)
         profiles = profile_columns(
             context.worksheet,
@@ -358,6 +378,8 @@ class MainWindow(QMainWindow):
             output_dir=Path(self.output_edit.text().strip() or "output"),
             sheet_name=self.get_selected_sheet_name(),
             selected_columns=selected_columns,
+            preserve_original_sheet=self.preserve_original_checkbox.isChecked(),
+            mapped_cell_mode=str(self.mapped_cell_mode_combo.currentData()),
             glossary_path=Path("glossary.tsv"),
             exclude_patterns_path=Path("exclude_patterns.yaml"),
             source_lang="EN",
@@ -624,6 +646,20 @@ class MainWindow(QMainWindow):
         if data:
             return str(data)
         return self.model_combo.currentText().strip()
+
+    def _update_preserve_original_label(
+        self, *, input_path: Path, sheet_name: str | None
+    ) -> None:
+        if not input_path.exists():
+            self.preserve_original_checkbox.setText(
+                "source_mapped.xlsx에 현재 시트 원문 백업 시트 보존"
+            )
+            return
+
+        display_sheet_name = sheet_name or input_path.stem
+        self.preserve_original_checkbox.setText(
+            f"source_mapped.xlsx에 '{display_sheet_name}_ORIGINAL' 백업 시트 보존"
+        )
 
     def _apply_provider_from_env(self) -> None:
         load_env_file(Path(".env"))

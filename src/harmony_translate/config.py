@@ -14,6 +14,8 @@ class AppConfig:
     output_dir: Path
     sheet_name: str | None
     selected_columns: list[str]
+    preserve_original_sheet: bool
+    mapped_cell_mode: str
     glossary_path: Path
     exclude_patterns_path: Path
     target_lang: str
