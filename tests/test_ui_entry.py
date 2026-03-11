@@ -257,3 +257,29 @@ def test_gemini_provider_shows_model_token_limits(
 
     window.close()
     app.quit()
+
+
+def test_progress_bar_updates_from_worker_signal(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Alpha"
+    path = tmp_path / "ui-progress.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    window.input_edit.setText(str(path))
+    window.load_workbook_preview()
+
+    window.handle_run_progress_value(42)
+
+    assert window.progress_bar.value() == 42
+    assert window.progress_bar.format() == "진행률 42%"
+
+    window.close()
+    app.quit()

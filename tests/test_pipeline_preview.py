@@ -330,3 +330,36 @@ def test_pipeline_emits_realtime_logs(tmp_path: Path) -> None:
     assert any("Pipeline started" in message for message in logs)
     assert any("Selected columns" in message for message in logs)
     assert any("Saved usage report" in message for message in logs)
+
+
+def test_pipeline_emits_progress_updates(tmp_path: Path) -> None:
+    workbook = build_sample_workbook()
+    input_path = tmp_path / "sample.xlsx"
+    workbook.save(input_path)
+
+    config = AppConfig(
+        input_path=input_path,
+        output_dir=tmp_path / "out",
+        sheet_name=None,
+        selected_columns=[],
+        glossary_path=Path("/Users/usabatch/coding/hazbin_project/glossary.tsv"),
+        exclude_patterns_path=Path(
+            "/Users/usabatch/coding/hazbin_project/exclude_patterns.yaml"
+        ),
+        target_lang="KO",
+        source_lang="EN",
+        provider="deepl",
+        deepl_api_key="",
+        deepl_base_url="https://api-free.deepl.com",
+        gemini_api_key="",
+        gemini_model="gemini-3-flash",
+        gemini_base_url="https://generativelanguage.googleapis.com",
+        cache_path=tmp_path / "cache.sqlite3",
+    )
+
+    progress_values: list[int] = []
+    run_pipeline(config, progress_callback=progress_values.append)
+
+    assert progress_values[0] == 0
+    assert progress_values[-1] == 100
+    assert progress_values == sorted(progress_values)

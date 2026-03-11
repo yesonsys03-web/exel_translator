@@ -44,6 +44,7 @@ class PipelineResult:
 
 
 LogCallback = Callable[[str], None]
+ProgressCallback = Callable[[int], None]
 
 
 def load_exclude_patterns(path: Path) -> list[re.Pattern[str]]:
@@ -60,7 +61,10 @@ def load_exclude_patterns(path: Path) -> list[re.Pattern[str]]:
 
 
 def run_pipeline(
-    config: AppConfig, *, log_callback: LogCallback | None = None
+    config: AppConfig,
+    *,
+    log_callback: LogCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> PipelineResult:
     # [ANCHOR:PIPELINE_RUN]
     _emit_log(log_callback, f"Pipeline started (provider={config.provider})")
@@ -82,6 +86,7 @@ def run_pipeline(
     selected_column_indexes = [profile.index for profile in selected_profiles]
     selected_headers = [profile.header for profile in selected_profiles]
     _emit_log(log_callback, f"Selected columns: {len(selected_headers)}")
+    _emit_progress(progress_callback, 0)
     translation_columns = append_translation_columns(
         context.worksheet, context.header_row, selected_column_indexes
     )
@@ -105,6 +110,8 @@ def run_pipeline(
     audit_entries: list[AuditEntry] = []
 
     try:
+        total_columns = len(translation_columns)
+        completed_columns = 0
         for source_column, target_column in translation_columns.items():
             _emit_log(
                 log_callback,
@@ -125,6 +132,9 @@ def run_pipeline(
                 cache_namespace=cache_namespace,
                 log_callback=log_callback,
             )
+            completed_columns += 1
+            progress_percent = int((completed_columns / max(total_columns, 1)) * 100)
+            _emit_progress(progress_callback, progress_percent)
 
         translated_path = config.output_dir / "translated.xlsx"
         source_mapped_path = config.output_dir / "source_mapped.xlsx"
@@ -158,6 +168,7 @@ def run_pipeline(
             usage_path,
         )
         _emit_log(log_callback, f"Saved usage report: {usage_path}")
+        _emit_progress(progress_callback, 100)
     finally:
         cache.close()
         _emit_log(log_callback, "Pipeline finished")
@@ -304,6 +315,12 @@ def _emit_log(log_callback: LogCallback | None, message: str) -> None:
     if log_callback is None:
         return
     log_callback(message)
+
+
+def _emit_progress(progress_callback: ProgressCallback | None, value: int) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(max(0, min(100, value)))
 
 
 def _column_label(context: SheetContext, column_index: int) -> str:

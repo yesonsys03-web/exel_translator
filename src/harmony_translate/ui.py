@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QAbstractItemView,
     QTableWidget,
@@ -50,14 +51,11 @@ CHECKED_STATE = Qt.CheckState.Checked
 USER_ROLE = Qt.ItemDataRole.UserRole
 RECOMMENDED_BG = Qt.GlobalColor.yellow
 KNOWN_GEMINI_MODELS = [
-    "gemini-3-pro",
     "gemini-3-flash",
-    "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
-    "gemini-1.5-pro",
     "gemini-1.5-flash",
 ]
 
@@ -77,6 +75,7 @@ class PipelineWorker(QObject):
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
     progress = pyqtSignal(str)
+    progress_value = pyqtSignal(int)
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -87,8 +86,15 @@ class PipelineWorker(QObject):
             self.progress.emit(message)
             print(message)
 
+        def _emit_progress_value(value: int) -> None:
+            self.progress_value.emit(value)
+
         try:
-            result = run_pipeline(self.config, log_callback=_emit_progress)
+            result = run_pipeline(
+                self.config,
+                log_callback=_emit_progress,
+                progress_callback=_emit_progress_value,
+            )
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             return
@@ -185,6 +191,12 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel("파일을 선택한 뒤 '컬럼 분석'을 누르세요.")
         layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("대기 중")
+        layout.addWidget(self.progress_bar)
 
         layout.addWidget(QLabel("실시간 로그"))
         self.log_view = QPlainTextEdit()
@@ -359,6 +371,8 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(False)
         self.load_button.setEnabled(False)
         self.status_label.setText("실행 중...")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("진행률 %p%")
         self.log_view.clear()
         worker_thread = QThread(self)
         worker = PipelineWorker(config)
@@ -369,6 +383,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(self.handle_run_finished)
         worker.failed.connect(self.handle_run_failed)
         worker.progress.connect(self.handle_run_progress)
+        worker.progress_value.connect(self.handle_run_progress_value)
         worker.finished.connect(worker_thread.quit)
         worker.failed.connect(worker_thread.quit)
         worker_thread.finished.connect(self.cleanup_worker)
@@ -382,6 +397,8 @@ class MainWindow(QMainWindow):
         self._update_selection_stats_label()
         preview_note = "\n프리뷰 모드로 실행됨" if result.preview_mode else ""
         self.status_label.setText("실행 완료")
+        self.progress_bar.setValue(100)
+        self.progress_bar.setFormat("완료 100%")
         QMessageBox.information(
             self,
             "완료",
@@ -401,10 +418,15 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(True)
         self.load_button.setEnabled(True)
         self.status_label.setText("실행 실패")
+        self.progress_bar.setFormat("실패")
         QMessageBox.critical(self, "실행 실패", message)
 
     def handle_run_progress(self, message: str) -> None:
         self.log_view.appendPlainText(message)
+
+    def handle_run_progress_value(self, value: int) -> None:
+        self.progress_bar.setValue(value)
+        self.progress_bar.setFormat(f"진행률 {value}%")
 
     def cleanup_worker(self) -> None:
         # [ANCHOR:UI_WORKER_CLEANUP]
