@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import re
+from typing import Any
+
+import yaml
+
+from harmony_translate.audit import AuditEntry, export_audit, export_usage_report
+from harmony_translate.cache import TranslationCache
+from harmony_translate.column_selector import (
+    ColumnProfile,
+    profile_columns,
+    select_translation_columns,
+)
+from harmony_translate.config import AppConfig
+from harmony_translate.excel_io import (
+    SheetContext,
+    append_translation_columns,
+    build_column_label,
+    build_sheet_context,
+    load_excel_workbook,
+    save_workbook,
+)
+from harmony_translate.glossary import apply_term_locks, load_glossary
+from harmony_translate.preprocess import (
+    build_deduplicated_texts,
+    looks_like_code,
+    normalize_text,
+)
+from harmony_translate.translator_deepl import DeepLClient
+from harmony_translate.translator_gemini import GeminiClient
+
+
+@dataclass
+class PipelineResult:
+    translated_path: Path
+    source_mapped_path: Path
+    audit_path: Path
+    usage_path: Path
+    selected_headers: list[str]
+    preview_mode: bool
+
+
+def load_exclude_patterns(path: Path) -> list[re.Pattern[str]]:
+    # [ANCHOR:PIPELINE_LOAD_EXCLUDE_PATTERNS]
+    if not path.exists():
+        return []
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        return []
+    raw_patterns = payload.get("patterns", [])
+    if not isinstance(raw_patterns, list):
+        return []
+    return [re.compile(str(pattern)) for pattern in raw_patterns]
+
+
+def run_pipeline(config: AppConfig) -> PipelineResult:
+    # [ANCHOR:PIPELINE_RUN]
+    workbook = load_excel_workbook(config.input_path)
+    mapped_workbook = load_excel_workbook(config.input_path)
+    context = build_sheet_context(workbook, config.sheet_name)
+    mapped_context = build_sheet_context(mapped_workbook, config.sheet_name)
+    glossary = load_glossary(config.glossary_path)
+    exclude_patterns = load_exclude_patterns(config.exclude_patterns_path)
+    profiles = profile_columns(
+        context.worksheet,
+        header_row=context.header_row,
+        data_start_row=context.data_start_row,
+    )
+    auto_selected = select_translation_columns(profiles)
+    selected_profiles = _resolve_selected_profiles(
+        auto_selected, profiles, config.selected_columns
+    )
+    selected_column_indexes = [profile.index for profile in selected_profiles]
+    selected_headers = [profile.header for profile in selected_profiles]
+    translation_columns = append_translation_columns(
+        context.worksheet, context.header_row, selected_column_indexes
+    )
+
+    cache = TranslationCache(config.cache_path)
+    client = _build_translation_client(config)
+    cache_namespace = _build_cache_namespace(config)
+    usage_before_count = 0
+    usage_limit = 0
+    if client is not None:
+        usage_before = client.usage()
+        if usage_before is not None:
+            usage_before_count = usage_before.character_count
+            usage_limit = usage_before.character_limit
+    audit_entries: list[AuditEntry] = []
+
+    try:
+        for source_column, target_column in translation_columns.items():
+            _translate_column(
+                context=context,
+                source_column=source_column,
+                target_column=target_column,
+                glossary=glossary,
+                exclude_patterns=exclude_patterns,
+                cache=cache,
+                client=client,
+                source_lang=config.source_lang,
+                target_lang=config.target_lang,
+                audit_entries=audit_entries,
+                mapped_context=mapped_context,
+                cache_namespace=cache_namespace,
+            )
+
+        translated_path = config.output_dir / "translated.xlsx"
+        source_mapped_path = config.output_dir / "source_mapped.xlsx"
+        audit_path = config.output_dir / "translation_audit.xlsx"
+        usage_path = config.output_dir / "usage_report.json"
+        save_workbook(workbook, translated_path)
+        save_workbook(mapped_workbook, source_mapped_path)
+        export_audit(audit_entries, audit_path)
+        usage_after_count = usage_before_count
+        if client is not None:
+            usage_after = client.usage()
+            if usage_after is not None:
+                usage_after_count = usage_after.character_count
+        export_usage_report(
+            {
+                "provider": config.provider,
+                "gemini_model": config.gemini_model,
+                "preview_mode": config.preview_mode,
+                "character_count_before": usage_before_count,
+                "character_limit": usage_limit,
+                "character_count_after": usage_after_count,
+                "selected_headers": selected_headers,
+                "translated_rows": sum(
+                    1 for entry in audit_entries if not entry.skipped
+                ),
+                "skipped_rows": sum(1 for entry in audit_entries if entry.skipped),
+            },
+            usage_path,
+        )
+    finally:
+        cache.close()
+
+    return PipelineResult(
+        translated_path=translated_path,
+        source_mapped_path=source_mapped_path,
+        audit_path=audit_path,
+        usage_path=usage_path,
+        selected_headers=selected_headers,
+        preview_mode=config.preview_mode,
+    )
+
+
+def _resolve_selected_profiles(
+    auto_selected: list[ColumnProfile],
+    all_profiles: list[ColumnProfile],
+    selected_columns: list[str],
+) -> list[ColumnProfile]:
+    if not selected_columns:
+        return auto_selected
+    selected_lookup = {name.upper() for name in selected_columns}
+    return [
+        profile
+        for profile in all_profiles
+        if profile.header.upper() in selected_lookup
+        or build_column_label(profile.index, profile.header).upper() in selected_lookup
+    ]
+
+
+def _translate_column(
+    *,
+    context: SheetContext,
+    source_column: int,
+    target_column: int,
+    glossary: dict[str, str],
+    exclude_patterns: list[re.Pattern[str]],
+    cache: TranslationCache,
+    client: DeepLClient | GeminiClient | None,
+    source_lang: str,
+    target_lang: str,
+    audit_entries: list[AuditEntry],
+    mapped_context: SheetContext,
+    cache_namespace: str,
+) -> None:
+    # [ANCHOR:PIPELINE_TRANSLATE_COLUMN]
+    values_by_row: dict[int, str] = {}
+    protected_values_by_row: dict[int, str] = {}
+    for row_index in range(context.data_start_row, context.worksheet.max_row + 1):
+        cell_value = context.worksheet.cell(row_index, source_column).value
+        if cell_value in (None, ""):
+            continue
+        if isinstance(cell_value, (int, float)):
+            audit_entries.append(
+                AuditEntry(
+                    context.worksheet.title,
+                    row_index,
+                    context.headers[source_column],
+                    str(cell_value),
+                    "",
+                    False,
+                    True,
+                    "numeric",
+                )
+            )
+            continue
+        normalized = normalize_text(str(cell_value))
+        if not normalized:
+            continue
+        if looks_like_code(normalized, exclude_patterns):
+            audit_entries.append(
+                AuditEntry(
+                    context.worksheet.title,
+                    row_index,
+                    context.headers[source_column],
+                    normalized,
+                    normalized,
+                    False,
+                    True,
+                    "excluded_pattern",
+                )
+            )
+            continue
+        values_by_row[row_index] = normalized
+        protected_values_by_row[row_index] = apply_term_locks(normalized, glossary)
+
+    deduped_texts, _ = build_deduplicated_texts(list(protected_values_by_row.values()))
+    cache_key_by_text = {text: f"{cache_namespace}|{text}" for text in deduped_texts}
+    cached_by_key = cache.get_many(list(cache_key_by_text.values()))
+    cached: dict[str, str] = {
+        text: cached_by_key[key]
+        for text, key in cache_key_by_text.items()
+        if key in cached_by_key
+    }
+    missing = [text for text in deduped_texts if text not in cached]
+    translated_pairs: dict[str, str] = {}
+    if client is not None and missing:
+        translated = client.translate_batch(
+            missing, source_lang=source_lang, target_lang=target_lang
+        )
+        if len(missing) != len(translated):
+            raise RuntimeError("DeepL returned a mismatched translation count")
+        translated_pairs = {
+            missing[index]: translated[index] for index in range(len(missing))
+        }
+        cache.set_many(
+            {
+                cache_key_by_text[text]: translated_text
+                for text, translated_text in translated_pairs.items()
+            }
+        )
+    all_translations = {**cached, **translated_pairs}
+
+    for row_index, protected in protected_values_by_row.items():
+        translated_text = all_translations.get(protected, "")
+        if translated_text:
+            context.worksheet.cell(
+                row=row_index, column=target_column, value=translated_text
+            )
+            mapped_context.worksheet.cell(
+                row=row_index, column=source_column, value=translated_text
+            )
+        audit_entries.append(
+            AuditEntry(
+                context.worksheet.title,
+                row_index,
+                context.headers[source_column],
+                values_by_row[row_index],
+                translated_text,
+                protected in cached,
+                client is None,
+                "missing_api_key_preview" if client is None else "",
+            )
+        )
+
+
+def _build_translation_client(config: AppConfig):
+    if config.preview_mode:
+        return None
+    provider = config.provider.strip().lower()
+    if provider == "gemini":
+        return GeminiClient(
+            api_key=config.gemini_api_key,
+            model=config.gemini_model,
+            base_url=config.gemini_base_url,
+        )
+    return DeepLClient(api_key=config.deepl_api_key, base_url=config.deepl_base_url)
+
+
+def _build_cache_namespace(config: AppConfig) -> str:
+    provider = config.provider.strip().lower()
+    if provider == "gemini":
+        return f"gemini:{config.gemini_model}:{config.source_lang}:{config.target_lang}"
+    return f"deepl:{config.source_lang}:{config.target_lang}"

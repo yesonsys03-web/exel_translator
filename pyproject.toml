@@ -1,0 +1,20 @@
+[project]
+name = "harmony-translate"
+version = "0.1.0"
+description = "DeepL-based Excel translation tool for Toon Boom Harmony production sheets"
+readme = "PLAN_DEEPL_TOONBOOM.md"
+requires-python = ">=3.11"
+dependencies = [
+  "openpyxl>=3.1.5",
+  "PyQt5>=5.15.11",
+  "PyYAML>=6.0.2",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
