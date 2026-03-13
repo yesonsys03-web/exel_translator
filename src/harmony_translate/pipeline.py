@@ -27,7 +27,10 @@ from harmony_translate.excel_io import (
     load_excel_workbook,
     save_workbook,
 )
-from harmony_translate.glossary import apply_term_locks, load_glossary
+from harmony_translate.glossary import (
+    apply_term_locks,
+    load_glossary_layers,
+)
 from harmony_translate.preprocess import (
     build_deduplicated_texts,
     looks_like_code,
@@ -83,7 +86,10 @@ def run_pipeline(
         backup_sheet.title = _build_original_sheet_name(
             mapped_workbook, mapped_sheet_name
         )
-    glossary = load_glossary(config.glossary_path)
+    glossary_paths = [config.glossary_path]
+    if config.global_glossary_path is not None:
+        glossary_paths = [config.global_glossary_path, config.glossary_path]
+    glossary = load_glossary_layers(glossary_paths)
     exclude_patterns = load_exclude_patterns(config.exclude_patterns_path)
     profiles = profile_columns(
         context.worksheet,
@@ -425,7 +431,11 @@ def _build_translation_client(config: AppConfig):
 
 
 def _build_cache_namespace(config: AppConfig) -> str:
+    project_segment = config.project_id.strip() or "default"
     provider = config.provider.strip().lower()
     if provider == "gemini":
-        return f"gemini:{config.gemini_model}:{config.source_lang}:{config.target_lang}"
-    return f"deepl:{config.source_lang}:{config.target_lang}"
+        return (
+            f"project:{project_segment}:gemini:{config.gemini_model}:"
+            f"{config.source_lang}:{config.target_lang}"
+        )
+    return f"project:{project_segment}:deepl:{config.source_lang}:{config.target_lang}"

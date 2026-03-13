@@ -51,6 +51,8 @@ class AppConfig:
     gemini_model: str
     gemini_base_url: str
     cache_path: Path
+    global_glossary_path: Path | None = None
+    project_id: str = ""
 
     @property
     def preview_mode(self) -> bool:
@@ -81,4 +83,6 @@ def _resolve_env_path(env_path: Path) -> Path:
     if env_path.is_absolute() or env_path.exists():
         return env_path
     return PROJECT_ROOT / env_path
+
+
 # === ANCHOR: CONFIG_END ===

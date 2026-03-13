@@ -32,6 +32,8 @@ def build_config(
     gemini_model: str,
     cache_path: Path,
     env_file: Path,
+    global_glossary_path: Path | None = None,
+    project_id: str = "",
 ) -> AppConfig:
     # [ANCHOR:CLI_BUILD_CONFIG]
     load_env_file(env_file)
@@ -66,6 +68,8 @@ def build_config(
         gemini_model=gemini_model,
         gemini_base_url=gemini_base_url,
         cache_path=cache_path,
+        global_glossary_path=global_glossary_path,
+        project_id=project_id,
     )
 
 
@@ -102,6 +106,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--glossary", default="glossary.tsv", help="Path to glossary TSV"
+    )
+    parser.add_argument(
+        "--global-glossary",
+        default="",
+        help="Optional global glossary TSV path (applied before --glossary)",
+    )
+    parser.add_argument(
+        "--project-id",
+        default="",
+        help="Optional project id for project-scoped glossary/cache separation",
     )
     parser.add_argument(
         "--exclude-patterns",
@@ -152,6 +166,12 @@ def main() -> int:
         gemini_model=args.gemini_model,
         cache_path=Path(args.cache_path),
         env_file=Path(args.env_file),
+        global_glossary_path=(
+            Path(args.global_glossary.strip())
+            if str(args.global_glossary).strip()
+            else None
+        ),
+        project_id=str(args.project_id).strip(),
     )
     result = run_pipeline(config, log_callback=print)
     if result.preview_mode:

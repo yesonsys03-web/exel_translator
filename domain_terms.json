@@ -1,0 +1,73 @@
+{
+  "domain_keywords": [
+    "node",
+    "view",
+    "camera",
+    "movement",
+    "timing",
+    "acting",
+    "composite",
+    "scene",
+    "shot",
+    "background",
+    "animation",
+    "effect",
+    "effects",
+    "render",
+    "export",
+    "cleanup",
+    "layer",
+    "peg",
+    "cutter",
+    "timeline",
+    "frame",
+    "keyframe",
+    "drawing",
+    "deform",
+    "rig",
+    "palette",
+    "exposure",
+    "xsheet",
+    "ink",
+    "paint",
+    "pass"
+  ],
+  "domain_acronyms": [
+    "BG",
+    "FX",
+    "SFX",
+    "FG",
+    "VFX",
+    "OGL",
+    "USD"
+  ],
+  "blocked": [
+    "the",
+    "and",
+    "or",
+    "to",
+    "for",
+    "with",
+    "from",
+    "this",
+    "that",
+    "there",
+    "where",
+    "before",
+    "after",
+    "check",
+    "adjust",
+    "open"
+  ],
+  "projects": {
+    "example_project": {
+      "domain_keywords": [
+        "prop"
+      ],
+      "domain_acronyms": [
+        "MAT"
+      ],
+      "blocked": []
+    }
+  }
+}
