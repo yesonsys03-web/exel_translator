@@ -1,3 +1,4 @@
+# === ANCHOR: CONFIG_START ===
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,6 +7,29 @@ import os
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def deepl_enabled() -> bool:
+    raw_value = os.environ.get("TRANSLATION_ENABLE_DEEPL", "")
+    return raw_value.strip().lower() in _TRUE_VALUES
+
+
+def supported_providers() -> tuple[str, ...]:
+    if deepl_enabled():
+        return ("gemini", "deepl")
+    return ("gemini",)
+
+
+def normalize_provider(provider: str | None, fallback: str = "gemini") -> str:
+    providers = supported_providers()
+    normalized = (provider or "").strip().lower()
+    if normalized in providers:
+        return normalized
+    normalized_fallback = (fallback or "").strip().lower()
+    if normalized_fallback in providers:
+        return normalized_fallback
+    return providers[0]
 
 
 @dataclass
@@ -57,3 +81,4 @@ def _resolve_env_path(env_path: Path) -> Path:
     if env_path.is_absolute() or env_path.exists():
         return env_path
     return PROJECT_ROOT / env_path
+# === ANCHOR: CONFIG_END ===

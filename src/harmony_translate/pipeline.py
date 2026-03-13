@@ -150,7 +150,8 @@ def run_pipeline(
             _emit_progress(progress_callback, progress_percent)
 
         translated_path = config.output_dir / "translated.xlsx"
-        source_mapped_path = config.output_dir / "source_mapped.xlsx"
+        source_mapped_filename = f"{config.input_path.stem}_KO.xlsx"
+        source_mapped_path = config.output_dir / source_mapped_filename
         audit_path = config.output_dir / "translation_audit.xlsx"
         usage_path = config.output_dir / "usage_report.json"
         save_workbook(workbook, translated_path)

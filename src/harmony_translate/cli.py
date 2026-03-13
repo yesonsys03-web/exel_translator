@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from harmony_translate.config import AppConfig, load_env_file
+from harmony_translate.config import (
+    AppConfig,
+    load_env_file,
+    normalize_provider,
+)
 from harmony_translate.pipeline import run_pipeline
 
 
@@ -39,9 +43,10 @@ def build_config(
     gemini_base_url = environ.get(
         "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com"
     )
-    env_provider = environ.get("TRANSLATION_PROVIDER", "deepl").strip().lower()
-    resolved_provider = (
-        (provider.strip().lower() or env_provider) if provider else env_provider
+    env_provider = normalize_provider(environ.get("TRANSLATION_PROVIDER", "gemini"))
+    resolved_provider = normalize_provider(
+        provider if provider else env_provider,
+        fallback=env_provider,
     )
     return AppConfig(
         input_path=input_path,
@@ -67,7 +72,7 @@ def build_config(
 def build_parser() -> argparse.ArgumentParser:
     # [ANCHOR:MAIN_CLI_ENTRY]
     parser = argparse.ArgumentParser(
-        description="Translate selected Excel columns with DeepL"
+        description="Translate selected Excel columns with Gemini"
     )
     parser.add_argument(
         "input",
@@ -82,13 +87,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preserve-original-sheet",
         action="store_true",
-        help="Keep a backup sheet with original source text in source_mapped.xlsx",
+        help="Keep a backup sheet with original source text in <source>_KO.xlsx",
     )
     parser.add_argument(
         "--mapped-cell-mode",
         default="translation_only",
         choices=["translation_only", "original_and_translation"],
-        help="How source_mapped.xlsx cells should display translated content",
+        help="How <source>_KO.xlsx cells should display translated content",
     )
     parser.add_argument(
         "--columns",
@@ -103,17 +108,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="exclude_patterns.yaml",
         help="Path to exclusion YAML",
     )
-    parser.add_argument("--source-lang", default="EN", help="DeepL source language")
-    parser.add_argument("--target-lang", default="KO", help="DeepL target language")
+    parser.add_argument("--source-lang", default="EN", help="Source language")
+    parser.add_argument("--target-lang", default="KO", help="Target language")
     parser.add_argument(
         "--provider",
-        default="deepl",
-        choices=["deepl", "gemini"],
-        help="Translation provider",
+        default="gemini",
+        help="Translation provider (deepl requires TRANSLATION_ENABLE_DEEPL=true)",
     )
     parser.add_argument(
         "--gemini-model",
-        default="gemini-3-flash",
+        default="gemini-2.5-flash",
         help="Gemini model id for Google AI Studio provider",
     )
     parser.add_argument("--env-file", default=".env", help="Optional env file path")
@@ -151,8 +155,11 @@ def main() -> int:
     )
     result = run_pipeline(config, log_callback=print)
     if result.preview_mode:
+        missing_key_name = (
+            "GEMINI_API_KEY" if config.provider == "gemini" else "DEEPL_API_KEY"
+        )
         print(
-            "Preview mode: DEEPL_API_KEY not set, translation API calls were skipped."
+            f"Preview mode: {missing_key_name} not set, translation API calls were skipped."
         )
     print(f"Translated workbook: {result.translated_path}")
     print(f"Source mapped workbook: {result.source_mapped_path}")

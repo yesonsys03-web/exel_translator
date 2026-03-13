@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
 )
 
 from harmony_translate.cli import DEFAULT_INPUT_PATH, build_config
-from harmony_translate.config import load_env_file
+from harmony_translate.config import deepl_enabled, load_env_file, normalize_provider
 from harmony_translate.column_selector import (
     profile_columns,
     select_translation_columns,
@@ -52,12 +52,10 @@ CHECKED_STATE = Qt.CheckState.Checked
 USER_ROLE = Qt.ItemDataRole.UserRole
 RECOMMENDED_BG = Qt.GlobalColor.yellow
 KNOWN_GEMINI_MODELS = [
-    "gemini-3-flash",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash",
+    "gemini-2.5-pro",
+    "gemini-3.1-pro-preview",
 ]
 
 
@@ -118,6 +116,8 @@ class MainWindow(QMainWindow):
         self.deepl_character_limit: int | None = None
         self.gemini_models_by_id: dict[str, GeminiModelInfo] = {}
 
+        load_env_file(Path(".env"))
+
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -145,8 +145,9 @@ class MainWindow(QMainWindow):
         form_layout.addWidget(self.sheet_combo, 2, 1, 1, 2)
 
         self.provider_combo = QComboBox()
-        self.provider_combo.addItem("DeepL", "deepl")
         self.provider_combo.addItem("Google AI Studio (Gemini)", "gemini")
+        if deepl_enabled():
+            self.provider_combo.addItem("DeepL", "deepl")
         self.provider_combo.currentIndexChanged.connect(self.handle_provider_changed)
         form_layout.addWidget(QLabel("번역 엔진"), 3, 0)
         form_layout.addWidget(self.provider_combo, 3, 1, 1, 2)
@@ -157,9 +158,7 @@ class MainWindow(QMainWindow):
         form_layout.addWidget(QLabel("Gemini 모델"), 4, 0)
         form_layout.addWidget(self.model_combo, 4, 1, 1, 2)
 
-        self.preserve_original_checkbox = QCheckBox(
-            "source_mapped.xlsx에 원문 시트 보존"
-        )
+        self.preserve_original_checkbox = QCheckBox("번역본(_KO.xlsx)에 원문 시트 보존")
         self.preserve_original_checkbox.setChecked(True)
         form_layout.addWidget(self.preserve_original_checkbox, 5, 0, 1, 3)
 
@@ -169,7 +168,7 @@ class MainWindow(QMainWindow):
             "원문 + 번역 함께 표시",
             "original_and_translation",
         )
-        form_layout.addWidget(QLabel("source_mapped 표시 방식"), 6, 0)
+        form_layout.addWidget(QLabel("번역본(_KO.xlsx) 표시 방식"), 6, 0)
         form_layout.addWidget(self.mapped_cell_mode_combo, 6, 1, 1, 2)
 
         button_row = QHBoxLayout()
@@ -572,28 +571,43 @@ class MainWindow(QMainWindow):
         try:
             client = GeminiClient(
                 api_key=api_key,
-                model=configured_model or "gemini-3-flash",
+                model=configured_model or "gemini-2.5-flash",
                 base_url=base_url,
             )
             models = client.list_models()
         except Exception:  # noqa: BLE001
             models = []
 
+        known_models = self._known_gemini_models()
+        preferred_models = self._preferred_gemini_models(
+            configured_model=configured_model,
+            current_model=current_model,
+            known_models=known_models,
+        )
+
         if not models:
-            fallback_model = configured_model or "gemini-3-flash"
+            fallback_model = configured_model or "gemini-2.5-flash"
             self.model_combo.addItem(fallback_model, fallback_model)
-            for model_id in KNOWN_GEMINI_MODELS:
+            for model_id in preferred_models:
                 if self.model_combo.findData(model_id) < 0:
                     self.model_combo.addItem(model_id, model_id)
             self.model_combo.setEnabled(True)
             self.model_combo.blockSignals(False)
             return
 
-        self.gemini_models_by_id = {model.model_id: model for model in models}
-        for model in models:
-            label = f"{model.model_id}"
-            self.model_combo.addItem(label, model.model_id)
-        for model_id in KNOWN_GEMINI_MODELS:
+        available_models = {model.model_id: model for model in models}
+        visible_model_ids = [
+            model_id for model_id in preferred_models if model_id in available_models
+        ]
+        if not visible_model_ids:
+            visible_model_ids = [models[0].model_id]
+
+        self.gemini_models_by_id = {
+            model_id: available_models[model_id] for model_id in visible_model_ids
+        }
+        for model_id in visible_model_ids:
+            self.model_combo.addItem(model_id, model_id)
+        for model_id in preferred_models:
             if self.model_combo.findData(model_id) < 0:
                 self.model_combo.addItem(model_id, model_id)
 
@@ -610,6 +624,36 @@ class MainWindow(QMainWindow):
 
         self.model_combo.setEnabled(True)
         self.model_combo.blockSignals(False)
+
+    @staticmethod
+    def _preferred_gemini_models(
+        *, configured_model: str, current_model: str, known_models: list[str]
+    ) -> list[str]:
+        ordered: list[str] = []
+        for model_id in known_models:
+            if model_id and model_id not in ordered:
+                ordered.append(model_id)
+        for model_id in (configured_model, current_model):
+            if model_id and model_id not in ordered:
+                ordered.append(model_id)
+        return ordered
+
+    def _known_gemini_models(self) -> list[str]:
+        configured_models = os.environ.get("GEMINI_MODEL_CANDIDATES", "").strip()
+        if not configured_models:
+            return list(KNOWN_GEMINI_MODELS)
+
+        models: list[str] = []
+        for model_id in configured_models.split(","):
+            normalized = model_id.strip()
+            if not normalized:
+                continue
+            if normalized in models:
+                continue
+            models.append(normalized)
+        if models:
+            return models
+        return list(KNOWN_GEMINI_MODELS)
 
     def _build_limit_text(self) -> str:
         provider = self._current_provider()
@@ -639,7 +683,7 @@ class MainWindow(QMainWindow):
 
     def _current_provider(self) -> str:
         data = self.provider_combo.currentData()
-        return str(data or "deepl")
+        return normalize_provider(str(data or "gemini"))
 
     def _selected_gemini_model(self) -> str:
         data = self.model_combo.currentData()
@@ -650,20 +694,21 @@ class MainWindow(QMainWindow):
     def _update_preserve_original_label(
         self, *, input_path: Path, sheet_name: str | None
     ) -> None:
+        output_name = f"{input_path.stem}_KO.xlsx"
         if not input_path.exists():
             self.preserve_original_checkbox.setText(
-                "source_mapped.xlsx에 현재 시트 원문 백업 시트 보존"
+                "번역본(_KO.xlsx)에 현재 시트 원문 백업 시트 보존"
             )
             return
 
         display_sheet_name = sheet_name or input_path.stem
         self.preserve_original_checkbox.setText(
-            f"source_mapped.xlsx에 '{display_sheet_name}_ORIGINAL' 백업 시트 보존"
+            f"{output_name}에 '{display_sheet_name}_ORIGINAL' 백업 시트 보존"
         )
 
     def _apply_provider_from_env(self) -> None:
         load_env_file(Path(".env"))
-        provider = os.environ.get("TRANSLATION_PROVIDER", "deepl").strip().lower()
+        provider = normalize_provider(os.environ.get("TRANSLATION_PROVIDER", "gemini"))
         index = self.provider_combo.findData(provider)
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)

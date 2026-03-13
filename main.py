@@ -1,3 +1,4 @@
+# === ANCHOR: MAIN_START ===
 from pathlib import Path
 import sys
 
@@ -14,3 +15,4 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         raise SystemExit(launch_ui())
     raise SystemExit(cli_main())
+# === ANCHOR: MAIN_END ===

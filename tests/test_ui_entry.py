@@ -24,6 +24,66 @@ def test_parser_default_input_still_matches_sample() -> None:
     parser = build_parser()
     args = parser.parse_args([])
     assert args.input == str(DEFAULT_INPUT_PATH)
+    assert args.provider == "gemini"
+    assert args.gemini_model == "gemini-2.5-flash"
+
+
+def test_ui_does_not_offer_deepl_provider(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Alpha"
+    path = tmp_path / "ui-provider.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    window.input_edit.setText(str(path))
+    window.load_workbook_preview()
+
+    provider_values = [
+        window.provider_combo.itemData(index)
+        for index in range(window.provider_combo.count())
+    ]
+    assert provider_values == ["gemini"]
+
+    window.close()
+    app.quit()
+
+
+def test_ui_offers_deepl_provider_when_feature_flag_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Alpha"
+    path = tmp_path / "ui-provider-enabled.xlsx"
+    workbook.save(path)
+
+    monkeypatch.setenv("TRANSLATION_ENABLE_DEEPL", "true")
+
+    window = MainWindow()
+    window.input_edit.setText(str(path))
+    window.load_workbook_preview()
+
+    provider_values = [
+        window.provider_combo.itemData(index)
+        for index in range(window.provider_combo.count())
+    ]
+    assert provider_values == ["gemini", "deepl"]
+
+    window.close()
+    app.quit()
 
 
 def test_main_exposes_gui_launcher() -> None:
@@ -161,7 +221,7 @@ def test_selected_column_character_count_updates_live(tmp_path: Path) -> None:
     app.quit()
 
 
-def test_selection_stats_shows_dynamic_deepl_limit(
+def test_deepl_env_provider_falls_back_to_gemini_in_ui(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     app = QApplication.instance() or QApplication([])
@@ -176,28 +236,14 @@ def test_selection_stats_shows_dynamic_deepl_limit(
     path = tmp_path / "ui-dynamic-limit.xlsx"
     workbook.save(path)
 
-    class FakeDeepLClient:
-        def __init__(self, api_key: str, base_url: str) -> None:
-            self.api_key = api_key
-            self.base_url = base_url
-
-        def usage(self):
-            class Usage:
-                character_count = 123456
-                character_limit = 750000
-
-            return Usage()
-
-    monkeypatch.setenv("DEEPL_API_KEY", "test-key")
-    monkeypatch.setattr("harmony_translate.ui.DeepLClient", FakeDeepLClient)
+    monkeypatch.setenv("TRANSLATION_PROVIDER", "deepl")
 
     window = MainWindow()
     window.input_edit.setText(str(path))
     window.load_workbook_preview()
 
-    stats_text = window.selection_stats_label.text()
-    assert "123,456/750,000자" in stats_text
-    assert "남은 626,544자" in stats_text
+    assert window._current_provider() == "gemini"
+    assert window.provider_combo.currentData() == "gemini"
 
     window.close()
     app.quit()
@@ -254,6 +300,123 @@ def test_gemini_provider_shows_model_token_limits(
     stats_text = window.selection_stats_label.text()
     assert "Gemini gemini-2.0-flash 제한 입력 1,048,576tok" in stats_text
     assert "출력 8,192tok" in stats_text
+
+    window.close()
+    app.quit()
+
+
+def test_gemini_model_candidates_env_controls_fallback_model_list(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Alpha"
+    path = tmp_path / "ui-gemini-model-candidates.xlsx"
+    workbook.save(path)
+
+    class FakeGeminiClient:
+        def __init__(self, api_key: str, model: str, base_url: str) -> None:
+            self.api_key = api_key
+            self.model = model
+            self.base_url = base_url
+
+        def list_models(self):
+            return []
+
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv(
+        "GEMINI_MODEL_CANDIDATES",
+        "gemini-2.5-pro, gemini-3.1-pro-preview, gemini-2.5-flash",
+    )
+    monkeypatch.setattr("harmony_translate.ui.GeminiClient", FakeGeminiClient)
+
+    window = MainWindow()
+    window.input_edit.setText(str(path))
+    provider_index = window.provider_combo.findData("gemini")
+    assert provider_index >= 0
+    window.provider_combo.setCurrentIndex(provider_index)
+    window.load_workbook_preview()
+
+    model_values = [
+        window.model_combo.itemData(index)
+        for index in range(window.model_combo.count())
+    ]
+    assert "gemini-2.5-pro" in model_values
+    assert "gemini-3.1-pro-preview" in model_values
+    assert "gemini-2.5-flash" in model_values
+
+    window.close()
+    app.quit()
+
+
+def test_gemini_dropdown_hides_legacy_models_when_primary_models_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Alpha"
+    path = tmp_path / "ui-gemini-curated-models.xlsx"
+    workbook.save(path)
+
+    class FakeModel:
+        def __init__(
+            self, model_id: str, display_name: str, input_limit: int, output_limit: int
+        ) -> None:
+            self.model_id = model_id
+            self.display_name = display_name
+            self.input_token_limit = input_limit
+            self.output_token_limit = output_limit
+
+    class FakeGeminiClient:
+        def __init__(self, api_key: str, model: str, base_url: str) -> None:
+            self.api_key = api_key
+            self.model = model
+            self.base_url = base_url
+
+        def list_models(self):
+            return [
+                FakeModel("gemini-2.0-flash", "Gemini 2.0 Flash", 1048576, 8192),
+                FakeModel("gemini-2.5-flash", "Gemini 2.5 Flash", 1048576, 65536),
+                FakeModel("gemini-2.5-pro", "Gemini 2.5 Pro", 1048576, 65536),
+                FakeModel(
+                    "gemini-3.1-pro-preview",
+                    "Gemini 3.1 Pro Preview",
+                    1048576,
+                    65536,
+                ),
+            ]
+
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setattr("harmony_translate.ui.GeminiClient", FakeGeminiClient)
+
+    window = MainWindow()
+    window.input_edit.setText(str(path))
+    provider_index = window.provider_combo.findData("gemini")
+    assert provider_index >= 0
+    window.provider_combo.setCurrentIndex(provider_index)
+    window.load_workbook_preview()
+
+    model_values = [
+        window.model_combo.itemData(index)
+        for index in range(window.model_combo.count())
+    ]
+    assert "gemini-2.5-flash" in model_values
+    assert "gemini-2.5-flash-lite" in model_values
+    assert "gemini-2.5-pro" in model_values
+    assert "gemini-3.1-pro-preview" in model_values
+    assert "gemini-2.0-flash" not in model_values
 
     window.close()
     app.quit()

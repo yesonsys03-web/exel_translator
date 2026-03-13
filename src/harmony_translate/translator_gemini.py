@@ -1,3 +1,4 @@
+# === ANCHOR: TRANSLATOR_GEMINI_START ===
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -31,7 +32,6 @@ class GeminiClient:
         "native-audio",
         "computer-use",
         "robotics",
-        "pro",
     )
 
     def __init__(self, api_key: str, model: str, base_url: str) -> None:
@@ -466,3 +466,4 @@ class GeminiClient:
         if not match:
             return None
         return float(match.group(1))
+# === ANCHOR: TRANSLATOR_GEMINI_END ===

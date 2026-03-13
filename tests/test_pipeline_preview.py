@@ -68,6 +68,7 @@ def test_pipeline_runs_in_preview_mode_without_api_key(tmp_path: Path) -> None:
     assert result.preview_mode is True
     assert result.translated_path.exists()
     assert result.source_mapped_path.exists()
+    assert result.source_mapped_path.name == "sample_KO.xlsx"
     assert result.audit_path.exists()
     assert result.usage_path.exists()
 
@@ -76,6 +77,8 @@ def test_cli_parser_defaults_input_to_sample_path() -> None:
     parser = build_parser()
     args = parser.parse_args([])
     assert str(args.input).endswith("HH0304-Episodic_Lead_Sheet_LIVE_Yeson.xlsx")
+    assert args.provider == "gemini"
+    assert args.gemini_model == "gemini-2.5-flash"
 
 
 def test_pipeline_translates_only_unique_missing_texts(

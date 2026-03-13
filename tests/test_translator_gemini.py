@@ -88,7 +88,7 @@ def test_list_models_excludes_non_text_generation_models(
     assert [model.model_id for model in models] == ["gemini-2.5-flash"]
 
 
-def test_list_models_excludes_pro_models_for_free_mode(
+def test_list_models_includes_pro_models_when_text_generation_supported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = GeminiClient(
@@ -122,7 +122,10 @@ def test_list_models_excludes_pro_models_for_free_mode(
     monkeypatch.setattr(client, "_request_json", fake_request_json)
     models = client.list_models()
 
-    assert [model.model_id for model in models] == ["gemini-2.5-flash"]
+    assert [model.model_id for model in models] == [
+        "gemini-2.5-flash",
+        "gemini-3.1-pro-preview",
+    ]
 
 
 def test_translate_batch_uses_generate_content_response(
