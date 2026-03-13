@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 import time
 from typing import Any
@@ -40,6 +41,7 @@ class GeminiClient:
         self.base_url = base_url.rstrip("/")
         self._resolved_model: str | None = None
         self._temporarily_unavailable_models: dict[str, float] = {}
+        self.request_timeout_seconds = _resolve_request_timeout_seconds()
 
     def usage(self):
         return None
@@ -252,7 +254,7 @@ class GeminiClient:
             method=method,
             headers={"Content-Type": "application/json"},
         )
-        with request.urlopen(req) as response:
+        with request.urlopen(req, timeout=self.request_timeout_seconds) as response:
             payload = json.loads(response.read().decode("utf-8"))
             if not isinstance(payload, dict):
                 raise GeminiError("Gemini response payload is not an object")
@@ -466,4 +468,15 @@ class GeminiClient:
         if not match:
             return None
         return float(match.group(1))
+
+
+def _resolve_request_timeout_seconds() -> float:
+    raw_value = os.environ.get("TRANSLATION_HTTP_TIMEOUT_SECONDS", "40").strip()
+    try:
+        timeout = float(raw_value)
+    except ValueError:
+        return 40.0
+    return timeout if timeout > 0 else 40.0
+
+
 # === ANCHOR: TRANSLATOR_GEMINI_END ===

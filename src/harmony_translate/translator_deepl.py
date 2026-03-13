@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from typing import Any
 from urllib import request, error
 
@@ -21,6 +22,7 @@ class DeepLClient:
     def __init__(self, api_key: str, base_url: str) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.request_timeout_seconds = _resolve_request_timeout_seconds()
 
     def usage(self) -> DeepLUsage:
         # [ANCHOR:DEEPL_USAGE_REQUEST]
@@ -115,7 +117,7 @@ class DeepLClient:
             },
         )
         try:
-            with request.urlopen(req) as response:
+            with request.urlopen(req, timeout=self.request_timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
                 if not isinstance(payload, dict):
                     raise DeepLError("DeepL response payload is not an object")
@@ -125,3 +127,12 @@ class DeepLClient:
             raise DeepLError(f"DeepL request failed: {exc.code} {detail}") from exc
         except error.URLError as exc:
             raise DeepLError(f"DeepL request failed: {exc.reason}") from exc
+
+
+def _resolve_request_timeout_seconds() -> float:
+    raw_value = os.environ.get("TRANSLATION_HTTP_TIMEOUT_SECONDS", "40").strip()
+    try:
+        timeout = float(raw_value)
+    except ValueError:
+        return 40.0
+    return timeout if timeout > 0 else 40.0

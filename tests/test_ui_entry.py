@@ -1,13 +1,15 @@
 from pathlib import Path
 import importlib.util
+import os
 
 import pytest
 from openpyxl import Workbook
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QTableWidgetItem
 
 from harmony_translate.cli import DEFAULT_INPUT_PATH, build_parser
-from harmony_translate.ui import MainWindow, USER_ROLE
+from harmony_translate.glossary import load_glossary
+from harmony_translate.ui import GLOSSARY_CANDIDATES_ROLE, MainWindow, USER_ROLE
 
 
 def load_main_module():
@@ -484,6 +486,439 @@ def test_preserve_original_checkbox_defaults_enabled(tmp_path: Path) -> None:
 
     assert "Dialogue_ORIGINAL" in window.preserve_original_checkbox.text()
     assert window.mapped_cell_mode_combo.currentData() == "translation_only"
+
+    window.close()
+    app.quit()
+
+
+def test_ui_infers_project_id_from_input_filename(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Alpha"
+    path = tmp_path / "HH0304-sample.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    window.project_id_edit.setText("")
+    window.input_edit.setText(str(path))
+    window.load_workbook_preview()
+
+    assert window.project_id_edit.text() == "HH0304"
+
+    window.close()
+    app.quit()
+
+
+def test_ui_saves_project_glossary_to_project_path(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Alpha"
+    path = tmp_path / "HH0304-ui-glossary.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    window.input_edit.setText(str(path))
+    window.load_workbook_preview()
+    window.project_id_edit.setText("TESTPROJ")
+    window.add_glossary_row()
+
+    source_item = window.glossary_table.item(0, 0)
+    target_item = window.glossary_table.item(0, 1)
+    assert source_item is not None
+    assert target_item is not None
+    source_item.setText("Node View")
+    target_item.setText("노드 뷰")
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        window.save_glossary_editor()
+        project_glossary_path = (
+            tmp_path / "glossary" / "projects" / "TESTPROJ" / "glossary.tsv"
+        )
+        assert project_glossary_path.exists()
+        glossary = load_glossary(project_glossary_path)
+        assert glossary == {"Node View": "노드 뷰"}
+    finally:
+        os.chdir(previous_cwd)
+
+    window.close()
+    app.quit()
+
+
+def test_ui_auto_populates_glossary_candidates_from_source(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["Y13"] = "NOTES"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Open Node View and check SFX timing."
+    sheet1["Y14"] = "Composite pass in Node View."
+    path = tmp_path / "auto-candidate.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    window.project_id_edit.setText("AUTOCASE")
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        window.input_edit.setText(str(path))
+        window.load_workbook_preview()
+    finally:
+        os.chdir(previous_cwd)
+
+    assert window.glossary_table.rowCount() > 0
+    candidates: set[str] = set()
+    for index in range(window.glossary_table.rowCount()):
+        item = window.glossary_table.item(index, 0)
+        if item is None:
+            continue
+        candidates.add(item.text())
+    assert "Node View" in candidates or "SFX" in candidates
+
+    window.close()
+    app.quit()
+
+
+def test_ui_generate_button_populates_candidates_for_lowercase_text(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "camera movement needs smoother acting"
+    sheet1["A15"] = "HH0304_010_0020"
+    sheet1["P15"] = "acting timing should match camera movement"
+    path = tmp_path / "manual-generate.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        window.input_edit.setText(str(path))
+        window.project_id_edit.setText("MANUALCASE")
+        window.load_workbook_preview()
+        window.glossary_table.setRowCount(0)
+        window.generate_glossary_candidates()
+    finally:
+        os.chdir(previous_cwd)
+
+    assert window.glossary_table.rowCount() > 0
+
+    window.close()
+    app.quit()
+
+
+def test_glossary_cell_click_creates_missing_item(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Alpha"
+    path = tmp_path / "click-edit.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    window.input_edit.setText(str(path))
+    window.load_workbook_preview()
+    window.glossary_table.setRowCount(1)
+    window.glossary_table.setItem(0, 0, None)
+    window.glossary_table.setItem(0, 1, None)
+
+    window.handle_glossary_cell_clicked(0, 1)
+
+    item = window.glossary_table.item(0, 1)
+    assert item is not None
+
+    window.close()
+    app.quit()
+
+
+def test_glossary_table_disables_elide_and_enables_wrap() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    assert window.glossary_table.wordWrap() is True
+    assert window.glossary_table.textElideMode() == Qt.TextElideMode.ElideNone
+
+    window.close()
+    app.quit()
+
+
+def test_generate_candidates_prefills_translation_from_global_glossary(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Open Node View for final composite."
+    path = tmp_path / "prefill-glossary.xlsx"
+    workbook.save(path)
+
+    glossary_root = tmp_path / "glossary"
+    glossary_root.mkdir(parents=True, exist_ok=True)
+    (glossary_root / "global.tsv").write_text("Node View\t노드 뷰\n", encoding="utf-8")
+
+    window = MainWindow()
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        window.input_edit.setText(str(path))
+        window.project_id_edit.setText("PREFILLCASE")
+        window.load_workbook_preview()
+        window.glossary_table.setRowCount(0)
+        window.generate_glossary_candidates()
+    finally:
+        os.chdir(previous_cwd)
+
+    matched_translation = ""
+    for index in range(window.glossary_table.rowCount()):
+        source_item = window.glossary_table.item(index, 0)
+        target_item = window.glossary_table.item(index, 1)
+        if source_item is None or target_item is None:
+            continue
+        if source_item.text() == "Node View":
+            matched_translation = target_item.text()
+            break
+
+    assert matched_translation == "노드 뷰"
+
+    window.close()
+    app.quit()
+
+
+def test_glossary_prefill_does_not_use_llm_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "camera movement needs smoother acting"
+    path = tmp_path / "no-llm-prefill.xlsx"
+    workbook.save(path)
+
+    monkeypatch.delenv("GLOSSARY_PREFILL_ALLOW_LLM", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+
+    def fail_translate(*args, **kwargs):
+        raise AssertionError("LLM prefill should be disabled by default")
+
+    monkeypatch.setattr(
+        "harmony_translate.ui.GeminiClient.translate_batch",
+        fail_translate,
+    )
+
+    window = MainWindow()
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        window.input_edit.setText(str(path))
+        window.project_id_edit.setText("NO_LLM")
+        window.load_workbook_preview()
+        window.glossary_table.setRowCount(0)
+        window.generate_glossary_candidates()
+    finally:
+        os.chdir(previous_cwd)
+
+    assert window.glossary_table.rowCount() > 0
+    non_empty_translation_found = False
+    for index in range(window.glossary_table.rowCount()):
+        target_item = window.glossary_table.item(index, 1)
+        if target_item is None:
+            continue
+        if target_item.text().strip():
+            non_empty_translation_found = True
+            break
+    assert non_empty_translation_found
+
+    window.close()
+    app.quit()
+
+
+def test_candidate_options_stored_for_translation_cell(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Node View setup and camera movement"
+    path = tmp_path / "candidate-options.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        window.input_edit.setText(str(path))
+        window.project_id_edit.setText("OPTCASE")
+        window.generate_glossary_candidates()
+    finally:
+        os.chdir(previous_cwd)
+
+    assert window.glossary_table.rowCount() > 0
+    assert window.glossary_table.columnCount() == 3
+    target_item = window.glossary_table.item(0, 1)
+    assert target_item is not None
+    raw_options = target_item.data(GLOSSARY_CANDIDATES_ROLE)
+    assert isinstance(raw_options, list)
+    assert len(raw_options) > 0
+    assert window.glossary_table.cellWidget(0, 2) is not None
+
+    window.close()
+    app.quit()
+
+
+def test_candidate_options_have_multiple_choices_without_llm(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIMATION"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Open Node View for camera movement timing"
+    path = tmp_path / "candidate-multi-options.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        window.input_edit.setText(str(path))
+        window.project_id_edit.setText("MULTIOPT")
+        window.generate_glossary_candidates()
+    finally:
+        os.chdir(previous_cwd)
+
+    assert window.glossary_table.rowCount() > 0
+    found_multi_option = False
+    for index in range(window.glossary_table.rowCount()):
+        target_item = window.glossary_table.item(index, 1)
+        if target_item is None:
+            continue
+        raw_options = target_item.data(GLOSSARY_CANDIDATES_ROLE)
+        if isinstance(raw_options, list) and len(raw_options) >= 2:
+            found_multi_option = True
+            break
+    assert found_multi_option
+
+    window.close()
+    app.quit()
+
+
+def test_generate_candidates_uses_checked_columns_only(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    workbook = Workbook()
+    sheet1 = workbook.active
+    assert sheet1 is not None
+    sheet1.title = "Sheet1"
+    sheet1["A13"] = "SHOT CODE"
+    sheet1["P13"] = "ANIM_A"
+    sheet1["Y13"] = "ANIM_B"
+    sheet1["A14"] = "HH0304_010_0010"
+    sheet1["P14"] = "Node View pass"
+    sheet1["Y14"] = "Camera movement timing"
+    path = tmp_path / "checked-columns-only.xlsx"
+    workbook.save(path)
+
+    window = MainWindow()
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        window.input_edit.setText(str(path))
+        window.load_workbook_preview()
+        for index in range(window.column_list.count()):
+            item = window.column_list.item(index)
+            if item is None:
+                continue
+            label = str(item.data(USER_ROLE) or "")
+            if "ANIM_A" in label:
+                item.setCheckState(Qt.CheckState.Checked)
+            elif "ANIM_B" in label:
+                item.setCheckState(Qt.CheckState.Unchecked)
+        window.glossary_table.setRowCount(0)
+        window.generate_glossary_candidates()
+    finally:
+        os.chdir(previous_cwd)
+
+    candidates: set[str] = set()
+    for index in range(window.glossary_table.rowCount()):
+        source_item = window.glossary_table.item(index, 0)
+        if source_item is None:
+            continue
+        candidates.add(source_item.text())
+
+    assert "Node View" in candidates
+    assert "Camera" not in candidates
+
+    window.close()
+    app.quit()
+
+
+def test_click_translation_cell_uses_candidate_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.glossary_table.setRowCount(1)
+    source_item = QTableWidgetItem("Node View")
+    target_item = QTableWidgetItem("노드 뷰")
+    target_item.setData(GLOSSARY_CANDIDATES_ROLE, ["노드 뷰", "노드 화면", "노드 창"])
+    window.glossary_table.setItem(0, 0, source_item)
+    window.glossary_table.setItem(0, 1, target_item)
+    window._set_candidate_button(0, ["노드 뷰", "노드 화면", "노드 창"])
+
+    monkeypatch.setattr(
+        "harmony_translate.ui.QInputDialog.getItem",
+        lambda *args, **kwargs: ("노드 화면", True),
+    )
+
+    window._show_translation_candidates(0)
+
+    result_item = window.glossary_table.item(0, 1)
+    assert result_item is not None
+    assert result_item.text() == "노드 화면"
 
     window.close()
     app.quit()

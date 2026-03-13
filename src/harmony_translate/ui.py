@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import difflib
 from pathlib import Path
 import os
+import re
 import sys
+from importlib import util as importlib_util
 
 from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -15,6 +18,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -42,14 +46,22 @@ from harmony_translate.excel_io import (
     build_sheet_preview,
     load_excel_workbook,
 )
+from harmony_translate.glossary import (
+    extract_glossary_candidates,
+    load_glossary,
+    load_glossary_layers,
+    save_glossary,
+)
 from harmony_translate.pipeline import PipelineResult, run_pipeline
 from harmony_translate.translator_deepl import DeepLClient
 from harmony_translate.translator_gemini import GeminiClient, GeminiModelInfo
+from harmony_translate.preprocess import normalize_text
 
 
 ITEM_IS_USER_CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
 CHECKED_STATE = Qt.CheckState.Checked
 USER_ROLE = Qt.ItemDataRole.UserRole
+GLOSSARY_CANDIDATES_ROLE = int(Qt.ItemDataRole.UserRole) + 10
 RECOMMENDED_BG = Qt.GlobalColor.yellow
 KNOWN_GEMINI_MODELS = [
     "gemini-2.5-flash",
@@ -57,6 +69,7 @@ KNOWN_GEMINI_MODELS = [
     "gemini-2.5-pro",
     "gemini-3.1-pro-preview",
 ]
+PROJECT_GLOSSARY_ROOT = Path("glossary/projects")
 
 
 @dataclass
@@ -144,23 +157,28 @@ class MainWindow(QMainWindow):
         form_layout.addWidget(QLabel("시트 선택"), 2, 0)
         form_layout.addWidget(self.sheet_combo, 2, 1, 1, 2)
 
+        self.project_id_edit = QLineEdit("")
+        self.project_id_edit.setPlaceholderText("예: HH0304")
+        form_layout.addWidget(QLabel("작품 ID"), 3, 0)
+        form_layout.addWidget(self.project_id_edit, 3, 1, 1, 2)
+
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("Google AI Studio (Gemini)", "gemini")
         if deepl_enabled():
             self.provider_combo.addItem("DeepL", "deepl")
         self.provider_combo.currentIndexChanged.connect(self.handle_provider_changed)
-        form_layout.addWidget(QLabel("번역 엔진"), 3, 0)
-        form_layout.addWidget(self.provider_combo, 3, 1, 1, 2)
+        form_layout.addWidget(QLabel("번역 엔진"), 4, 0)
+        form_layout.addWidget(self.provider_combo, 4, 1, 1, 2)
 
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.currentIndexChanged.connect(self.handle_gemini_model_changed)
-        form_layout.addWidget(QLabel("Gemini 모델"), 4, 0)
-        form_layout.addWidget(self.model_combo, 4, 1, 1, 2)
+        form_layout.addWidget(QLabel("Gemini 모델"), 5, 0)
+        form_layout.addWidget(self.model_combo, 5, 1, 1, 2)
 
         self.preserve_original_checkbox = QCheckBox("번역본(_KO.xlsx)에 원문 시트 보존")
         self.preserve_original_checkbox.setChecked(True)
-        form_layout.addWidget(self.preserve_original_checkbox, 5, 0, 1, 3)
+        form_layout.addWidget(self.preserve_original_checkbox, 6, 0, 1, 3)
 
         self.mapped_cell_mode_combo = QComboBox()
         self.mapped_cell_mode_combo.addItem("번역만 표시", "translation_only")
@@ -168,8 +186,8 @@ class MainWindow(QMainWindow):
             "원문 + 번역 함께 표시",
             "original_and_translation",
         )
-        form_layout.addWidget(QLabel("번역본(_KO.xlsx) 표시 방식"), 6, 0)
-        form_layout.addWidget(self.mapped_cell_mode_combo, 6, 1, 1, 2)
+        form_layout.addWidget(QLabel("번역본(_KO.xlsx) 표시 방식"), 7, 0)
+        form_layout.addWidget(self.mapped_cell_mode_combo, 7, 1, 1, 2)
 
         button_row = QHBoxLayout()
         layout.addLayout(button_row)
@@ -179,6 +197,43 @@ class MainWindow(QMainWindow):
         self.run_button = QPushButton("실행")
         self.run_button.clicked.connect(self.run_from_ui)
         button_row.addWidget(self.run_button)
+
+        glossary_button_row = QHBoxLayout()
+        layout.addLayout(glossary_button_row)
+        self.glossary_load_button = QPushButton("용어집 불러오기")
+        self.glossary_load_button.clicked.connect(self.load_glossary_editor)
+        glossary_button_row.addWidget(self.glossary_load_button)
+        self.glossary_save_button = QPushButton("용어집 저장")
+        self.glossary_save_button.clicked.connect(self.save_glossary_editor)
+        glossary_button_row.addWidget(self.glossary_save_button)
+        self.glossary_add_row_button = QPushButton("용어 추가")
+        self.glossary_add_row_button.clicked.connect(self.add_glossary_row)
+        glossary_button_row.addWidget(self.glossary_add_row_button)
+        self.glossary_remove_row_button = QPushButton("용어 삭제")
+        self.glossary_remove_row_button.clicked.connect(self.remove_glossary_row)
+        glossary_button_row.addWidget(self.glossary_remove_row_button)
+        self.glossary_generate_button = QPushButton("자동 용어 생성")
+        self.glossary_generate_button.clicked.connect(self.generate_glossary_candidates)
+        glossary_button_row.addWidget(self.glossary_generate_button)
+
+        layout.addWidget(QLabel("작품별 용어집 편집"))
+        self.glossary_table = QTableWidget()
+        self.glossary_table.setColumnCount(3)
+        self.glossary_table.setHorizontalHeaderLabels(["원문", "번역", "후보"])
+        self.glossary_table.setWordWrap(True)
+        self.glossary_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.glossary_table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.glossary_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.glossary_table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self.glossary_table.cellClicked.connect(self.handle_glossary_cell_clicked)
+        self.glossary_table.itemChanged.connect(self.handle_glossary_item_changed)
+        glossary_header = self.glossary_table.horizontalHeader()
+        if glossary_header is not None:
+            glossary_header.setSectionResizeMode(0, QHeaderView.Stretch)
+            glossary_header.setSectionResizeMode(1, QHeaderView.Stretch)
+            glossary_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.glossary_table.setColumnWidth(2, 110)
+        layout.addWidget(self.glossary_table)
 
         layout.addWidget(QLabel("시트 컬럼 목록(추천 컬럼은 기본 체크)"))
         self.column_list = QListWidget()
@@ -219,6 +274,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_view)
 
         self.load_workbook_preview()
+        self.load_glossary_editor()
         self._apply_provider_from_env()
         self._refresh_provider_limits()
 
@@ -250,6 +306,489 @@ class MainWindow(QMainWindow):
         if selected:
             self.output_edit.setText(selected)
 
+    def load_glossary_editor(self) -> None:
+        # [ANCHOR:UI_GLOSSARY_LOAD]
+        glossary_path = self._project_glossary_path()
+        glossary = load_glossary(glossary_path)
+        self.glossary_table.setRowCount(0)
+        for source, target in sorted(glossary.items()):
+            row_index = self.glossary_table.rowCount()
+            self.glossary_table.insertRow(row_index)
+            self.glossary_table.setItem(row_index, 0, QTableWidgetItem(source))
+            self.glossary_table.setItem(row_index, 1, QTableWidgetItem(target))
+            self._set_candidate_button(row_index, [])
+        self._refresh_glossary_table_rows()
+        self.status_label.setText(f"용어집 로드: {glossary_path}")
+
+    def save_glossary_editor(self) -> None:
+        # [ANCHOR:UI_GLOSSARY_SAVE]
+        glossary_path = self._project_glossary_path()
+        glossary = self._collect_glossary_rows()
+        save_glossary(glossary_path, glossary)
+        self.status_label.setText(f"용어집 저장: {glossary_path} ({len(glossary)}개)")
+
+    def add_glossary_row(self) -> None:
+        # [ANCHOR:UI_GLOSSARY_ADD_ROW]
+        row_index = self.glossary_table.rowCount()
+        self.glossary_table.insertRow(row_index)
+        self.glossary_table.setItem(row_index, 0, QTableWidgetItem(""))
+        self.glossary_table.setItem(row_index, 1, QTableWidgetItem(""))
+        self._set_candidate_button(row_index, [])
+        self._refresh_glossary_table_rows()
+        self.glossary_table.setCurrentCell(row_index, 0)
+
+    def remove_glossary_row(self) -> None:
+        # [ANCHOR:UI_GLOSSARY_REMOVE_ROW]
+        current_row = self.glossary_table.currentRow()
+        if current_row < 0:
+            return
+        self.glossary_table.removeRow(current_row)
+        self._refresh_glossary_table_rows()
+
+    def handle_glossary_cell_clicked(self, row: int, column: int) -> None:
+        # [ANCHOR:UI_GLOSSARY_CELL_CLICK]
+        item = self.glossary_table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem("")
+            self.glossary_table.setItem(row, column, item)
+        if column == 1:
+            self._show_translation_candidates(row)
+            return
+        self.glossary_table.setCurrentItem(item)
+        self.glossary_table.editItem(item)
+
+    def handle_candidate_button_clicked(self) -> None:
+        # [ANCHOR:UI_GLOSSARY_CANDIDATE_BUTTON_CLICK]
+        sender = self.sender()
+        if not isinstance(sender, QPushButton):
+            return
+        row = self.glossary_table.indexAt(sender.pos()).row()
+        if row < 0:
+            return
+        self._show_translation_candidates(row)
+
+    def handle_glossary_item_changed(self, item: QTableWidgetItem) -> None:
+        # [ANCHOR:UI_GLOSSARY_ITEM_CHANGED]
+        del item
+        self._refresh_glossary_table_rows()
+
+    def generate_glossary_candidates(self) -> None:
+        # [ANCHOR:UI_GLOSSARY_GENERATE]
+        input_path = Path(self.input_edit.text().strip())
+        if not input_path.exists():
+            QMessageBox.warning(self, "입력 오류", "입력 엑셀 파일을 찾을 수 없습니다.")
+            return
+        workbook = load_excel_workbook(input_path)
+        context = build_sheet_context(workbook, self.get_selected_sheet_name())
+        profiles = profile_columns(
+            context.worksheet,
+            header_row=context.header_row,
+            data_start_row=context.data_start_row,
+        )
+        selected = select_translation_columns(profiles)
+        self.glossary_table.setRowCount(0)
+        self._populate_auto_glossary_candidates(context, selected, profiles)
+        self.status_label.setText(
+            f"자동 용어 생성 완료: {self.glossary_table.rowCount()}개"
+        )
+
+    def _collect_glossary_rows(self) -> dict[str, str]:
+        # [ANCHOR:UI_GLOSSARY_COLLECT_ROWS]
+        glossary: dict[str, str] = {}
+        for row_index in range(self.glossary_table.rowCount()):
+            source_item = self.glossary_table.item(row_index, 0)
+            target_item = self.glossary_table.item(row_index, 1)
+            source = source_item.text().strip() if source_item is not None else ""
+            target = target_item.text().strip() if target_item is not None else ""
+            if source and target:
+                glossary[source] = target
+        return glossary
+
+    def _populate_auto_glossary_candidates(
+        self, context, selected_profiles, all_profiles
+    ) -> None:
+        # [ANCHOR:UI_GLOSSARY_AUTO_POPULATE]
+        if self.glossary_table.rowCount() > 0:
+            return
+        candidate_profiles = self._resolve_candidate_profiles_for_glossary(
+            selected_profiles,
+            all_profiles,
+        )
+        if not candidate_profiles:
+            candidate_profiles = [
+                profile for profile in all_profiles if int(profile.text_count) > 0
+            ]
+        selected_indexes = [int(profile.index) for profile in candidate_profiles]
+        if not selected_indexes:
+            return
+        values: list[str] = []
+        max_rows = min(context.worksheet.max_row, context.data_start_row + 1000)
+        for row_index in range(context.data_start_row, max_rows + 1):
+            for column_index in selected_indexes:
+                cell_value = context.worksheet.cell(row_index, column_index).value
+                if cell_value in (None, ""):
+                    continue
+                if isinstance(cell_value, (int, float)):
+                    continue
+                normalized = normalize_text(str(cell_value))
+                if normalized:
+                    values.append(normalized)
+        candidates = extract_glossary_candidates(
+            values,
+            project_id=self._project_id(),
+        )
+        if not candidates:
+            return
+        suggested_translations = self._suggest_candidate_translations(candidates)
+        for candidate in candidates:
+            row_index = self.glossary_table.rowCount()
+            self.glossary_table.insertRow(row_index)
+            self.glossary_table.setItem(row_index, 0, QTableWidgetItem(candidate))
+            options = suggested_translations.get(candidate, [])
+            target_item = QTableWidgetItem(options[0] if options else "")
+            target_item.setData(GLOSSARY_CANDIDATES_ROLE, options)
+            self.glossary_table.setItem(row_index, 1, target_item)
+            self._set_candidate_button(row_index, options)
+        self._refresh_glossary_table_rows()
+
+    def _resolve_candidate_profiles_for_glossary(self, selected_profiles, all_profiles):
+        # [ANCHOR:UI_GLOSSARY_RESOLVE_CANDIDATE_PROFILES]
+        checked_labels = self._checked_column_labels()
+        if not checked_labels:
+            return selected_profiles
+        matched_profiles = [
+            profile
+            for profile in all_profiles
+            if build_column_label(profile.index, profile.header) in checked_labels
+        ]
+        return matched_profiles if matched_profiles else selected_profiles
+
+    def _checked_column_labels(self) -> set[str]:
+        # [ANCHOR:UI_CHECKED_COLUMN_LABELS]
+        labels: set[str] = set()
+        for index in range(self.column_list.count()):
+            item = self.column_list.item(index)
+            if item is None:
+                continue
+            if item.checkState() != CHECKED_STATE:
+                continue
+            label = str(item.data(USER_ROLE) or "").strip()
+            if label:
+                labels.add(label)
+        return labels
+
+    def _set_candidate_button(self, row_index: int, options: list[str]) -> None:
+        # [ANCHOR:UI_GLOSSARY_SET_CANDIDATE_BUTTON]
+        button = QPushButton("후보 선택")
+        if not options:
+            button.setText("후보 없음")
+            button.setEnabled(False)
+        button.clicked.connect(self.handle_candidate_button_clicked)
+        self.glossary_table.setCellWidget(row_index, 2, button)
+
+    def _show_translation_candidates(self, row: int) -> None:
+        # [ANCHOR:UI_GLOSSARY_SHOW_CANDIDATES]
+        item = self.glossary_table.item(row, 1)
+        if item is None:
+            item = QTableWidgetItem("")
+            self.glossary_table.setItem(row, 1, item)
+        raw_options = item.data(GLOSSARY_CANDIDATES_ROLE)
+        options: list[str] = []
+        if isinstance(raw_options, list):
+            options = [
+                str(value).strip() for value in raw_options if str(value).strip()
+            ]
+        if not options:
+            self.glossary_table.setCurrentItem(item)
+            self.glossary_table.editItem(item)
+            return
+        current_value = item.text().strip()
+        if current_value and current_value not in options:
+            options.insert(0, current_value)
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "번역 후보 선택",
+            "후보 선택 또는 직접 입력",
+            options,
+            0,
+            True,
+        )
+        if accepted:
+            item.setText(str(selected).strip())
+
+    def _refresh_glossary_table_rows(self) -> None:
+        # [ANCHOR:UI_GLOSSARY_REFRESH_ROWS]
+        self.glossary_table.resizeRowsToContents()
+
+    def _suggest_candidate_translations(
+        self, candidates: list[str]
+    ) -> dict[str, list[str]]:
+        # [ANCHOR:UI_GLOSSARY_SUGGEST_TRANSLATIONS]
+        suggestions: dict[str, list[str]] = {}
+        glossary_paths = [self._project_glossary_path()]
+        if self._project_id():
+            glossary_paths = [
+                self._global_glossary_path(),
+                self._project_glossary_path(),
+            ]
+        existing = load_glossary_layers(glossary_paths)
+        existing_lower = {source.lower(): target for source, target in existing.items()}
+        unresolved: list[str] = []
+        for candidate in candidates:
+            unresolved.append(candidate)
+
+        translated = self._translate_terms_without_llm(unresolved)
+        translated_by_source = {
+            source: target for source, target in zip(unresolved, translated)
+        }
+        existing_sources = list(existing.keys())
+        for candidate in candidates:
+            options: list[str] = []
+            seen: set[str] = set()
+
+            exact = existing.get(candidate)
+            lowered = existing_lower.get(candidate.lower())
+            for value in (exact, lowered):
+                normalized = str(value or "").strip()
+                key = normalized.lower()
+                if not normalized or key in seen:
+                    continue
+                options.append(normalized)
+                seen.add(key)
+
+            for similar_source in difflib.get_close_matches(
+                candidate,
+                existing_sources,
+                n=3,
+                cutoff=0.6,
+            ):
+                normalized = existing.get(similar_source, "").strip()
+                key = normalized.lower()
+                if not normalized or key in seen:
+                    continue
+                options.append(normalized)
+                seen.add(key)
+
+            offline = translated_by_source.get(candidate, "").strip()
+            offline_key = offline.lower()
+            if offline and offline_key not in seen:
+                options.append(offline)
+                seen.add(offline_key)
+
+            for variant in self._build_translation_variants(offline):
+                key = variant.lower()
+                if not variant or key in seen:
+                    continue
+                options.append(variant)
+                seen.add(key)
+
+            raw_source = candidate.strip()
+            source_key = raw_source.lower()
+            if raw_source and source_key not in seen:
+                options.append(raw_source)
+                seen.add(source_key)
+
+            if not options:
+                options.append(candidate)
+            suggestions[candidate] = options[:3]
+        return suggestions
+
+    def _build_translation_variants(self, text: str) -> list[str]:
+        # [ANCHOR:UI_GLOSSARY_BUILD_VARIANTS]
+        base = text.strip()
+        if not base:
+            return []
+        substitutions = {
+            "뷰": ["화면", "창"],
+            "움직임": ["모션"],
+            "타이밍": ["시점"],
+            "컴포지트": ["합성"],
+            "익스포트": ["내보내기"],
+            "클린업": ["정리"],
+        }
+        variants: list[str] = []
+        for source, targets in substitutions.items():
+            if source not in base:
+                continue
+            for target in targets:
+                variants.append(base.replace(source, target, 1).strip())
+        return variants
+
+    def _translate_terms_without_llm(self, terms: list[str]) -> list[str]:
+        # [ANCHOR:UI_GLOSSARY_TRANSLATE_TERMS_OFFLINE]
+        if not terms:
+            return []
+        if importlib_util.find_spec("argostranslate") is None:
+            return self._translate_terms_rule_based(terms)
+        try:
+            from argostranslate import package, translate  # type: ignore[import-not-found]
+        except Exception:  # noqa: BLE001
+            return self._translate_terms_rule_based(terms)
+
+        languages = translate.get_installed_languages()
+        source_language = next((lang for lang in languages if lang.code == "en"), None)
+        target_language = next((lang for lang in languages if lang.code == "ko"), None)
+        if source_language is None or target_language is None:
+            return self._translate_terms_rule_based(terms)
+
+        translation = source_language.get_translation(target_language)
+        if translation is None:
+            package_index = package.get_available_packages()
+            install_target = next(
+                (
+                    item
+                    for item in package_index
+                    if item.from_code == "en" and item.to_code == "ko"
+                ),
+                None,
+            )
+            if install_target is None:
+                return self._translate_terms_rule_based(terms)
+            try:
+                package.install_from_path(install_target.download())
+            except Exception:  # noqa: BLE001
+                return self._translate_terms_rule_based(terms)
+            languages = translate.get_installed_languages()
+            source_language = next(
+                (lang for lang in languages if lang.code == "en"), None
+            )
+            target_language = next(
+                (lang for lang in languages if lang.code == "ko"), None
+            )
+            if source_language is None or target_language is None:
+                return self._translate_terms_rule_based(terms)
+            translation = source_language.get_translation(target_language)
+            if translation is None:
+                return self._translate_terms_rule_based(terms)
+
+        try:
+            translated = [translation.translate(term) for term in terms]
+            fallback = self._translate_terms_rule_based(terms)
+            merged: list[str] = []
+            for index, original in enumerate(terms):
+                value = translated[index].strip()
+                if value:
+                    merged.append(value)
+                    continue
+                fallback_value = fallback[index].strip()
+                merged.append(fallback_value if fallback_value else original)
+            return merged
+        except Exception:  # noqa: BLE001
+            return self._translate_terms_rule_based(terms)
+
+    def _translate_terms_rule_based(self, terms: list[str]) -> list[str]:
+        # [ANCHOR:UI_GLOSSARY_TRANSLATE_TERMS_RULE_BASED]
+        dictionary = {
+            "node": "노드",
+            "view": "뷰",
+            "camera": "카메라",
+            "movement": "움직임",
+            "timing": "타이밍",
+            "acting": "액팅",
+            "composite": "컴포지트",
+            "scene": "씬",
+            "shot": "샷",
+            "background": "배경",
+            "animation": "애니메이션",
+            "effect": "이펙트",
+            "effects": "이펙트",
+            "sfx": "효과음",
+            "bg": "배경",
+            "fx": "효과",
+            "render": "렌더",
+            "export": "익스포트",
+            "cleanup": "클린업",
+            "layer": "레이어",
+            "peg": "페그",
+            "cutter": "커터",
+        }
+        translated_terms: list[str] = []
+        for term in terms:
+            parts = re.findall(r"[A-Za-z]+|[^A-Za-z]+", term)
+            translated_parts: list[str] = []
+            for part in parts:
+                if re.fullmatch(r"[A-Za-z]+", part):
+                    replacement = dictionary.get(part.lower())
+                    translated_parts.append(
+                        str(replacement) if replacement is not None else str(part)
+                    )
+                else:
+                    translated_parts.append(str(part))
+            combined = "".join(translated_parts).strip()
+            translated_terms.append(combined if combined else term)
+        return translated_terms
+
+    def _translate_terms_with_provider(self, terms: list[str]) -> list[str]:
+        # [ANCHOR:UI_GLOSSARY_TRANSLATE_TERMS]
+        if not terms:
+            return []
+        provider = self._current_provider()
+        if provider == "gemini":
+            api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+            if not api_key:
+                return [""] * len(terms)
+            base_url = os.environ.get(
+                "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com"
+            )
+            client = GeminiClient(
+                api_key=api_key,
+                model=self._selected_gemini_model() or "gemini-2.5-flash",
+                base_url=base_url,
+            )
+            try:
+                return client.translate_batch(
+                    terms,
+                    source_lang="EN",
+                    target_lang="KO",
+                )
+            except Exception:  # noqa: BLE001
+                return [""] * len(terms)
+
+        api_key = os.environ.get("DEEPL_API_KEY", "").strip()
+        if not api_key:
+            return [""] * len(terms)
+        base_url = os.environ.get("DEEPL_BASE_URL", "https://api-free.deepl.com")
+        client = DeepLClient(api_key=api_key, base_url=base_url)
+        try:
+            return client.translate_batch(
+                terms,
+                source_lang="EN",
+                target_lang="KO",
+            )
+        except Exception:  # noqa: BLE001
+            return [""] * len(terms)
+
+    def _project_glossary_path(self) -> Path:
+        # [ANCHOR:UI_PROJECT_GLOSSARY_PATH]
+        project_id = self.project_id_edit.text().strip()
+        if not project_id:
+            return Path("glossary.tsv")
+        return PROJECT_GLOSSARY_ROOT / project_id / "glossary.tsv"
+
+    @staticmethod
+    def _global_glossary_path() -> Path:
+        # [ANCHOR:UI_GLOBAL_GLOSSARY_PATH]
+        return Path("glossary/global.tsv")
+
+    def _project_id(self) -> str:
+        return self.project_id_edit.text().strip()
+
+    def _cache_path(self) -> Path:
+        # [ANCHOR:UI_CACHE_PATH]
+        project_id = self._project_id()
+        if not project_id:
+            return Path(".cache/translations.sqlite3")
+        return Path(f".cache/translations_{project_id}.sqlite3")
+
+    def _infer_project_id_from_input(self, input_path: Path) -> None:
+        # [ANCHOR:UI_INFER_PROJECT_ID]
+        if self._project_id():
+            return
+        match = re.search(r"([A-Za-z]{2}\d{4})", input_path.stem)
+        if match is None:
+            return
+        self.project_id_edit.setText(match.group(1).upper())
+
     def load_workbook_preview(self) -> None:
         # [ANCHOR:UI_LOAD_PREVIEW]
         input_path = Path(self.input_edit.text().strip())
@@ -260,6 +799,8 @@ class MainWindow(QMainWindow):
             self._update_selection_stats_label()
             return
 
+        self._infer_project_id_from_input(input_path)
+        self.load_glossary_editor()
         workbook = load_excel_workbook(input_path)
         self._refresh_provider_limits()
         self._populate_sheet_names(workbook.sheetnames)
@@ -274,6 +815,7 @@ class MainWindow(QMainWindow):
             data_start_row=context.data_start_row,
         )
         selected = select_translation_columns(profiles)
+        self._populate_auto_glossary_candidates(context, selected, profiles)
         recommended_labels = {
             build_column_label(profile.index, profile.header) for profile in selected
         }
@@ -379,22 +921,27 @@ class MainWindow(QMainWindow):
             selected_columns=selected_columns,
             preserve_original_sheet=self.preserve_original_checkbox.isChecked(),
             mapped_cell_mode=str(self.mapped_cell_mode_combo.currentData()),
-            glossary_path=Path("glossary.tsv"),
+            glossary_path=self._project_glossary_path(),
             exclude_patterns_path=Path("exclude_patterns.yaml"),
             source_lang="EN",
             target_lang="KO",
             provider=self._current_provider(),
             gemini_model=self._selected_gemini_model(),
-            cache_path=Path(".cache/translations.sqlite3"),
+            cache_path=self._cache_path(),
             env_file=Path(".env"),
+            global_glossary_path=(
+                self._global_glossary_path() if self._project_id() else None
+            ),
+            project_id=self._project_id(),
         )
 
         self.run_button.setEnabled(False)
         self.load_button.setEnabled(False)
         self.status_label.setText("실행 중...")
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("진행률 %p%")
         self.log_view.clear()
+        self.log_view.appendPlainText("실행 시작: 백그라운드 파이프라인을 준비합니다.")
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("처리 중...")
         worker_thread = QThread(self)
         worker = PipelineWorker(config)
         self.worker_thread = worker_thread
@@ -418,6 +965,7 @@ class MainWindow(QMainWindow):
         self._update_selection_stats_label()
         preview_note = "\n프리뷰 모드로 실행됨" if result.preview_mode else ""
         self.status_label.setText("실행 완료")
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("완료 100%")
         QMessageBox.information(
@@ -439,6 +987,8 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(True)
         self.load_button.setEnabled(True)
         self.status_label.setText("실행 실패")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self.progress_bar.setFormat("실패")
         QMessageBox.critical(self, "실행 실패", message)
 
@@ -446,6 +996,8 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(message)
 
     def handle_run_progress_value(self, value: int) -> None:
+        if self.progress_bar.maximum() == 0:
+            self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(value)
         self.progress_bar.setFormat(f"진행률 {value}%")
 
